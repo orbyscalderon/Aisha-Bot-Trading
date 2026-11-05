@@ -51,15 +51,14 @@ def _take_profit_hit(position: Position, quote: Quote, cfg: ExitsConfig) -> bool
         return False
     if not cfg.trailing:
         return position.pct_change(quote.price) > cfg.take_profit_pct
-    # Trailing: se arma cuando el pico supera entrada + take_profit_pct y cierra
-    # cuando el precio cae más de take_profit_pct desde ese pico (no desde la
-    # entrada). La distancia reutiliza take_profit_pct: la config no tiene un
-    # parámetro de trailing propio.
+    # Trailing: take_profit_pct es el umbral de armado (sobre la entrada, medido
+    # con el pico); armado, cierra al caer más de trailing_pct desde el pico.
+    assert cfg.trailing_pct is not None  # garantizado por ExitsConfig
     peak = next_peak_price(position, quote)
     if position.pct_change(peak) <= cfg.take_profit_pct:
         return False
     drop_from_peak = (peak - quote.price) / peak * _HUNDRED
-    return drop_from_peak > cfg.take_profit_pct
+    return drop_from_peak > cfg.trailing_pct
 
 
 def _time_stop_hit(position: Position, now: datetime, cfg: ExitsConfig) -> bool:

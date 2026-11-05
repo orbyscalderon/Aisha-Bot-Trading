@@ -61,6 +61,8 @@ class ExitsConfig(_Strict):
     # Obligatoria y de un único valor: exactamente una salida primaria.
     primary: Literal["copy_sell", "take_profit", "time_stop"]
     trailing: bool = False
+    # Cuánto se devuelve desde el pico antes de cerrar; solo con trailing=true.
+    trailing_pct: Decimal | None = Field(default=None, gt=0, le=100)
 
     @model_validator(mode="after")
     def _check_primary(self) -> ExitsConfig:
@@ -68,6 +70,8 @@ class ExitsConfig(_Strict):
             raise ValueError("exits.take_profit_pct es obligatorio con primary=take_profit")
         if self.primary == "time_stop" and self.time_stop_hours is None:
             raise ValueError("exits.time_stop_hours es obligatorio con primary=time_stop")
+        if self.trailing and self.trailing_pct is None:
+            raise ValueError("exits.trailing_pct es obligatorio con trailing=true")
         return self
 
 

@@ -262,3 +262,17 @@ def test_mirror_strategy_requires_flat_amount_as_fallback(yaml_with):
     raw["sizing"] = {"strategy": "mirror", "mirror_pct": 10, "mirror_cap_usd": 200}
     with pytest.raises(ConfigError, match="flat_amount_usd"):
         load_config(yaml_with(raw=raw))
+
+
+def test_trailing_requires_trailing_pct(yaml_with):
+    raw = copy.deepcopy(BASE)
+    raw["exits"].update({"primary": "take_profit", "take_profit_pct": 30, "trailing": True})
+    with pytest.raises(ConfigError, match="trailing_pct"):
+        load_config(yaml_with(raw=raw))
+
+
+def test_trailing_with_trailing_pct_loads(yaml_with):
+    raw = copy.deepcopy(BASE)
+    raw["exits"].update({"primary": "take_profit", "take_profit_pct": 30,
+                         "trailing": True, "trailing_pct": 10})
+    assert load_config(yaml_with(raw=raw)).exits.trailing_pct == Decimal("10")

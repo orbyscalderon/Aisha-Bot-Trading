@@ -22,12 +22,14 @@ def q(price):
     return Quote(symbol="BTCUSDT", price=Decimal(price), timestamp=T1)
 
 
-def cfg(stop_loss_pct=None, primary="copy_sell", tp_pct=None, trailing=False, time_stop_hours=None):
+def cfg(stop_loss_pct=None, primary="copy_sell", tp_pct=None, trailing=False, trailing_pct=None,
+        time_stop_hours=None):
     return ExitsConfig(
         stop_loss_pct=None if stop_loss_pct is None else Decimal(stop_loss_pct),
         primary=primary,
         take_profit_pct=None if tp_pct is None else Decimal(tp_pct),
         trailing=trailing,
+        trailing_pct=None if trailing_pct is None else Decimal(trailing_pct),
         time_stop_hours=time_stop_hours,
     )
 
@@ -58,19 +60,21 @@ def test_take_profit_not_triggered_exactly_at_threshold():
 
 
 def test_trailing_uses_peak_not_entry():
-    # Pico 200, trailing de 30% (take_profit_pct) -> el umbral baja a 140.
-    # 179 sigue por encima de la entrada +30%, pero el trailing deja correr: no cierra.
-    c = cfg(primary="take_profit", tp_pct=30, trailing=True)
-    assert evaluate_exit(pos(entry=100, peak=200), q(179), T1, c, None) is None
-    # 139 cae más de 30% desde el pico (200): cierra, medido desde el pico y no desde la entrada.
-    d = evaluate_exit(pos(entry=100, peak=200), q(139), T1, c, None)
+    # pico 200 -> armado (+100% supera el tp de 30%). trailing_pct 10 -> cierra bajo 180.
+    d = evaluate_exit(pos(entry=100, peak=200), q(179), T1,
+                      cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None)
     assert d.reason is ExitReason.TAKE_PROFIT
 
 
-def test_trailing_not_armed_before_take_profit_level_reached():
-    # El pico nunca llegó a entrada +30%: la caída desde el pico no es una salida con ganancia.
-    c = cfg(primary="take_profit", tp_pct=30, trailing=True)
-    assert evaluate_exit(pos(entry=100, peak=110), q(100), T1, c, None) is None
+def test_trailing_holds_above_the_retrace_threshold():
+    assert evaluate_exit(pos(entry=100, peak=200), q(181), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
+
+
+def test_trailing_not_armed_below_take_profit_threshold():
+    # pico 120 = +20%, no alcanza el tp de 30%: no armado, no cierra
+    assert evaluate_exit(pos(entry=100, peak=120), q(100), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
 
 
 def test_trailing_disabled_by_default():
