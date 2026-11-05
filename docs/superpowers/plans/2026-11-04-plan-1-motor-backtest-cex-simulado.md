@@ -1443,7 +1443,7 @@ git commit -m "feat(cli): añadir CLI, empaquetado y documentación"
 
 **Files:**
 - Create: `core/rules/protections.py`
-- Modify: `core/config.py` (sección `protections` y `groups`), `core/rules/risk.py` (invocación)
+- Modify: `core/config.py` (sección `protections` y `groups`). **No toca `core/rules/risk.py`**: las protecciones las invoca el motor (Tarea 12), no los gates de riesgo. Son dos decisiones independientes que el motor consulta en orden.
 - Test: `tests/core/rules/test_protections.py`
 
 **Interfaces:**
