@@ -193,3 +193,35 @@ def test_env_example_has_no_secret_values():
         if line and not line.startswith("#"):
             key, _, value = line.partition("=")
             assert key and value == "", f"{key} no debe llevar valor en la plantilla"
+
+
+def _with_execution(value):
+    data = copy.deepcopy(BASE)
+    data["execution"] = value
+    return data
+
+
+@pytest.mark.parametrize("bad", [0, "", False, []])
+def test_execution_market_override_must_be_a_mapping(yaml_with, bad):
+    with pytest.raises(ConfigError, match="cex"):
+        load_config(yaml_with(raw=_with_execution({"cex": bad})))
+
+
+@pytest.mark.parametrize("bad", [[], 0, "", "cex"])
+def test_execution_itself_must_be_a_mapping(yaml_with, bad):
+    with pytest.raises(ConfigError, match="execution"):
+        load_config(yaml_with(raw=_with_execution(bad)))
+
+
+def test_unknown_key_in_risk_is_rejected(yaml_with):
+    data = copy.deepcopy(BASE)
+    data["risk"]["max_usd_per_tokn"] = 50
+    with pytest.raises(ConfigError, match="max_usd_per_tokn"):
+        load_config(yaml_with(raw=data))
+
+
+def test_unknown_root_key_is_rejected(yaml_with):
+    data = copy.deepcopy(BASE)
+    data["modee"] = "live"
+    with pytest.raises(ConfigError, match="modee"):
+        load_config(yaml_with(raw=data))

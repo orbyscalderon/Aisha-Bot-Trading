@@ -103,7 +103,7 @@ class BotConfig(_Strict):
     @field_validator("execution", mode="before")
     @classmethod
     def _fill_execution_defaults(cls, value: Any) -> dict[Market, Any]:
-        overrides = value or {}
+        overrides = {} if value is None else value
         if not isinstance(overrides, dict):
             raise ValueError("execution debe ser un mapa mercado -> parámetros")
         try:
@@ -112,7 +112,9 @@ class BotConfig(_Strict):
             raise ValueError(f"mercado desconocido en execution: {exc}") from exc
         merged: dict[Market, Any] = {}
         for market, defaults in _EXECUTION_DEFAULTS.items():
-            override = by_market.get(market) or {}
+            override = by_market.get(market)
+            if override is None:
+                override = {}
             if not isinstance(override, dict):
                 raise ValueError(f"execution.{market.value} debe ser un mapa")
             merged[market] = {**defaults, **override}
