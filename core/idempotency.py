@@ -45,7 +45,7 @@ def _digest(kind: str, **fields: str) -> str:
     for name, value in fields.items():
         if _SEP in value:
             raise ValueError(
-                f"{name} contains the reserved separator ; refusing to build "
+                f"{name} contains the reserved separator \x1f; refusing to build "
                 f"an ambiguous client_order_id: {value!r}"
             )
     # FORMATO CONGELADO. NO lleva reloj: el objetivo es que la misma señal

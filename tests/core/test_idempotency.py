@@ -226,7 +226,7 @@ def test_exit_and_entry_ids_never_collide():
     assert exit_order_id("x", Side.SELL, ExitReason.STOP_LOSS) !=         client_order_id("x", "STOP_LOSS", "SELL", Side.SELL)
 
 
-@pytest.mark.parametrize("position_id", ["ab"])
+@pytest.mark.parametrize("position_id", ["a\x1fb"])
 def test_exit_order_id_rejects_separator(position_id):
     with pytest.raises(ValueError, match="position_id"):
         exit_order_id(position_id, Side.SELL, ExitReason.STOP_LOSS)
