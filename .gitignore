@@ -11,3 +11,4 @@ STOP
 .playwright/
 logs/
 .pytest_cache/
+.superpowers/
