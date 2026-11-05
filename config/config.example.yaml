@@ -1,0 +1,18 @@
+# Configuración de ejemplo. Valores elegidos para limitar la pérdida máxima
+# antes que para maximizar la ganancia.
+#
+# Exposición máxima simultánea: 5 posiciones x 50 USD por token = 250 USD.
+# El bot se apaga solo al perder 50 USD en un día.
+# La salida primaria es copy_sell (copiar la salida del trader es el copy-trading);
+# el stop-loss del 15 % y el time-stop de 72 h son redes de seguridad, no la estrategia.
+# El trailing va desactivado: persigue máximos y en activos ruidosos cierra antes de tiempo.
+mode: paper
+sizing:   { strategy: flat, flat_amount_usd: 25 }
+exits:    { stop_loss_pct: 15, primary: copy_sell, time_stop_hours: 72, trailing: false }
+risk:
+  max_usd_per_token:   50
+  max_open_positions:  5
+  max_usd_per_day:     150
+  max_daily_loss_usd:  50
+  hard_max_order_usd:  50
+cadence:  { entry_cron: "0 * * * *", exit_interval_seconds: 60 }
