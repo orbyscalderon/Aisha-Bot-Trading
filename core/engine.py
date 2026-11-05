@@ -41,7 +41,7 @@ from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 
 from core.config import BotConfig
-from core.idempotency import client_order_id
+from core.idempotency import client_order_id, exit_order_id
 from core.models import (
     Order, Position, Quote, RejectReason, Side, Signal,
 )
@@ -277,7 +277,7 @@ class Engine:
                   amount_usd=amount, used_fallback=sized.used_fallback)
 
         # 5. Reserva del intent: después de todos los rechazos.
-        coid = client_order_id(signal.id, signal.trader_id, signal.symbol, Side.BUY, now)
+        coid = client_order_id(signal.id, signal.trader_id, signal.symbol, Side.BUY)
         reserved = self._repo.reserve_intent(
             coid, {"signal_id": signal.id, "symbol": signal.symbol, "amount_usd": str(amount)}, now
         )
@@ -326,7 +326,11 @@ class Engine:
         now: datetime,
     ) -> ProtectionState:
         p = self._cfg.protections
-        lookback = max(timedelta(hours=p.streak_window_hours), timedelta(minutes=p.cooldown_minutes))
+        # La pausa de la racha bloquea hasta último_stop + pausa: la consulta debe llegar tan lejos.
+        lookback = max(
+            timedelta(hours=p.streak_window_hours + p.streak_pause_hours),
+            timedelta(minutes=p.cooldown_minutes),
+        )
         return ProtectionState(
             closed_positions=self._portfolio.closed_positions_since(now - lookback),
             peak_equity_usd=peak_equity,
@@ -373,8 +377,7 @@ class Engine:
         if decision is None:
             return None
 
-        coid = client_order_id(position.signal_id, position.trader_id, position.symbol,
-                               Side.SELL, now)
+        coid = exit_order_id(position.id, Side.SELL, decision.reason)
         if not self._repo.reserve_intent(
             coid, {"position_id": position.id, "reason": decision.reason.value}, now
         ):

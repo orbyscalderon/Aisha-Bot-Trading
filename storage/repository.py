@@ -208,7 +208,7 @@ class Repository:
     def reserve_intent(
         self, client_order_id: str, payload: dict, now: datetime | None = None
     ) -> bool:
-        """Reserva el identificador antes de salir a la red.
+        """Reserva el identificador antes de salir a la red (o re-reserva uno FAILED).
 
         Se apoya en la PRIMARY KEY: intenta el INSERT y devuelve False si ya
         existía. Un SELECT previo dejaría una ventana de carrera.
@@ -225,7 +225,16 @@ class Repository:
                     ),
                 )
         except sqlite3.IntegrityError:
-            return False
+            # Un FAILED significa que sabemos que la orden NO se ejecutó: reintentar
+            # con el mismo identificador es seguro. RESERVED, SENT y CONFIRMED bloquean.
+            with self._conn:
+                cur = self._conn.execute(
+                    "UPDATE order_intents SET status = ?, payload = ?, created_at = ?,"
+                    " error = NULL WHERE client_order_id = ? AND status = ?",
+                    (IntentStatus.RESERVED.value, json.dumps(payload, sort_keys=True, default=str),
+                     created, client_order_id, IntentStatus.FAILED.value),
+                )
+            return cur.rowcount == 1
         return True
 
     def _transition_intent(

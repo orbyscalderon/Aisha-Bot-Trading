@@ -4,8 +4,8 @@ from decimal import Decimal
 
 import pytest
 
-from core.idempotency import IntentStatus, OrderIntent, client_order_id
-from core.models import Fill, Market, Side
+from core.idempotency import IntentStatus, OrderIntent, client_order_id, exit_order_id
+from core.models import ExitReason, Fill, Market, Side
 from storage.db import init_db
 from storage.repository import Repository
 
@@ -37,42 +37,30 @@ def fill_for(coid):
 # --- client_order_id ----------------------------------------------------
 
 def test_client_order_id_is_deterministic():
-    assert client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0) == \
-           client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0)
+    assert client_order_id("s1", "t1", "BTC/USDT", Side.BUY) == \
+           client_order_id("s1", "t1", "BTC/USDT", Side.BUY)
 
 
 def test_client_order_id_differs_per_field():
-    base = client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0)
-    assert base != client_order_id("s2", "t1", "BTC/USDT", Side.BUY, T0)
-    assert base != client_order_id("s1", "t2", "BTC/USDT", Side.BUY, T0)
-    assert base != client_order_id("s1", "t1", "ETH/USDT", Side.BUY, T0)
-    assert base != client_order_id("s1", "t1", "BTC/USDT", Side.SELL, T0)
-    assert base != client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T1)
+    base = client_order_id("s1", "t1", "BTC/USDT", Side.BUY)
+    assert base != client_order_id("s2", "t1", "BTC/USDT", Side.BUY)
+    assert base != client_order_id("s1", "t2", "BTC/USDT", Side.BUY)
+    assert base != client_order_id("s1", "t1", "ETH/USDT", Side.BUY)
+    assert base != client_order_id("s1", "t1", "BTC/USDT", Side.SELL)
 
 
 def test_client_order_id_fits_exchange_limit():
     # ccxt y Binance limitan el clientOrderId a 36 caracteres
-    coid = client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0)
+    coid = client_order_id("s1", "t1", "BTC/USDT", Side.BUY)
     assert len(coid) <= 36
     assert len(coid) == 35 and coid.startswith("ct-")
     int(coid[3:], 16)  # 32 caracteres hexadecimales
 
 
 def test_client_order_id_separator_prevents_field_collisions():
-    a = client_order_id("ab", "c", "BTC/USDT", Side.BUY, T0)
-    b = client_order_id("a", "bc", "BTC/USDT", Side.BUY, T0)
+    a = client_order_id("ab", "c", "BTC/USDT", Side.BUY)
+    b = client_order_id("a", "bc", "BTC/USDT", Side.BUY)
     assert a != b
-
-
-def test_client_order_id_same_instant_in_other_timezone_is_equal():
-    plus2 = timezone(timedelta(hours=2))
-    assert client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0) == \
-           client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0.astimezone(plus2))
-
-
-def test_client_order_id_rejects_naive_datetime():
-    with pytest.raises(ValueError):
-        client_order_id("s1", "t1", "BTC/USDT", Side.BUY, datetime(2026, 11, 4, 12))
 
 
 # --- reserva ------------------------------------------------------------
@@ -209,11 +197,56 @@ def test_client_order_id_rejects_separator_in_field(field):
     args = {"signal_id": "s1", "trader_id": "t1", "symbol": "BTC/USDT"}
     args[field] = "a\x1fb"
     with pytest.raises(ValueError, match=field):
-        client_order_id(args["signal_id"], args["trader_id"], args["symbol"], Side.BUY, T0)
+        client_order_id(args["signal_id"], args["trader_id"], args["symbol"], Side.BUY)
 
 
 def test_client_order_id_separator_shift_tuples_never_collide_silently():
     # ("a\x1fb","c") y ("a","b\x1fc") darían el mismo raw: ahora ambos se rechazan.
     for sid, tid in (("a\x1fb", "c"), ("a", "b\x1fc")):
         with pytest.raises(ValueError):
-            client_order_id(sid, tid, "BTC/USDT", Side.BUY, T0)
+            client_order_id(sid, tid, "BTC/USDT", Side.BUY)
+
+
+# --- ronda 2: el reloj no forma parte del identificador ------------------
+
+def test_client_order_id_takes_no_timestamp():
+    with pytest.raises(TypeError):
+        client_order_id("s1", "t1", "BTC/USDT", Side.BUY, T0)
+
+
+def test_exit_order_id_is_deterministic_and_clockless():
+    a = exit_order_id("p1", Side.SELL, ExitReason.STOP_LOSS)
+    assert a == exit_order_id("p1", Side.SELL, ExitReason.STOP_LOSS)
+    assert a != exit_order_id("p2", Side.SELL, ExitReason.STOP_LOSS)
+    assert a != exit_order_id("p1", Side.SELL, ExitReason.TIME_STOP)
+    assert len(a) == 35 and a.startswith("ct-")
+
+
+def test_exit_and_entry_ids_never_collide():
+    assert exit_order_id("x", Side.SELL, ExitReason.STOP_LOSS) !=         client_order_id("x", "STOP_LOSS", "SELL", Side.SELL)
+
+
+@pytest.mark.parametrize("position_id", ["ab"])
+def test_exit_order_id_rejects_separator(position_id):
+    with pytest.raises(ValueError, match="position_id"):
+        exit_order_id(position_id, Side.SELL, ExitReason.STOP_LOSS)
+
+
+def test_failed_intent_can_be_reserved_again(repo):
+    repo.reserve_intent("c1", PAYLOAD)
+    repo.mark_intent_sent("c1")
+    repo.mark_intent_failed("c1", "timeout")
+    assert repo.reserve_intent("c1", {"intento": 2}) is True
+    (intent,) = repo.unconfirmed_intents()
+    assert intent.status is IntentStatus.RESERVED
+    assert intent.payload == {"intento": 2} and intent.error is None
+
+
+@pytest.mark.parametrize("state", ["reserved", "sent", "confirmed"])
+def test_non_failed_intents_still_block_reservation(repo, state):
+    repo.reserve_intent("c1", PAYLOAD)
+    if state == "sent":
+        repo.mark_intent_sent("c1")
+    if state == "confirmed":
+        repo.mark_intent_confirmed("c1", fill_for("c1"))
+    assert repo.reserve_intent("c1", PAYLOAD) is False

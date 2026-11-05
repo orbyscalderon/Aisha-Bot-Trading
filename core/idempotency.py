@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import StrEnum
 
-from core.models import Side
+from core.models import ExitReason, Side
 
 PREFIX = "ct-"
 HEX_LENGTH = 32  # 3 + 32 = 35 <= 36, límite de Binance y de la mayoría de CEX vía ccxt
@@ -41,22 +41,34 @@ class OrderIntent:
     error: str | None = None
 
 
-def client_order_id(
-    signal_id: str, trader_id: str, symbol: str, side: Side, cycle_ts: datetime
-) -> str:
-    """Identificador determinista: ct- + 32 hex de sha256 (35 caracteres)."""
-    if cycle_ts.tzinfo is None or cycle_ts.utcoffset() is None:
-        raise ValueError(f"naive datetime not allowed: {cycle_ts!r}")
-    for name, value in (("signal_id", signal_id), ("trader_id", trader_id), ("symbol", symbol)):
+def _digest(kind: str, **fields: str) -> str:
+    for name, value in fields.items():
         if _SEP in value:
             raise ValueError(
-                f"{name} contains the reserved separator \x1f; refusing to build "
+                f"{name} contains the reserved separator ; refusing to build "
                 f"an ambiguous client_order_id: {value!r}"
             )
-    # FORMATO CONGELADO: no cambiar timespec ni la normalización a UTC. Cualquier
-    # cambio altera todos los identificadores y la deduplicación dejaría de
-    # reconocer los intents en vuelo (órdenes de estado ambiguo) durante la
-    # actualización.
-    ts = cycle_ts.astimezone(timezone.utc).isoformat(timespec="microseconds")
-    raw = _SEP.join((signal_id, trader_id, symbol, Side(side).value, ts))
+    # FORMATO CONGELADO. NO lleva reloj: el objetivo es que la misma señal
+    # reprocesada (p. ej. tras una caída, con otro ``now``) produzca el mismo
+    # identificador; con un timestamp la garantía no existiría. ``kind`` separa
+    # el espacio de entradas del de salidas.
+    raw = _SEP.join((kind, *fields.values()))
     return PREFIX + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:HEX_LENGTH]
+
+
+def client_order_id(signal_id: str, trader_id: str, symbol: str, side: Side) -> str:
+    """Identificador de ENTRADA: ct- + 32 hex de sha256 (35 caracteres).
+
+    La unicidad la aporta ``signal_id`` (las fuentes lo derivan del contenido de
+    la señal): la misma operación repetida más tarde es otra señal.
+    """
+    return _digest(
+        "entry", signal_id=signal_id, trader_id=trader_id, symbol=symbol, side=Side(side).value
+    )
+
+
+def exit_order_id(position_id: str, side: Side, exit_reason: ExitReason) -> str:
+    """Identificador de SALIDA: (posición, lado, motivo). Sin reloj."""
+    return _digest(
+        "exit", position_id=position_id, side=Side(side).value, exit_reason=ExitReason(exit_reason).value
+    )

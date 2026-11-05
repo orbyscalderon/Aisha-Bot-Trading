@@ -26,7 +26,13 @@ class MarketDataSource(ABC):
     def get_quote(self, symbol: str) -> Quote: ...
 
     @abstractmethod
-    def get_balance(self) -> Decimal: ...
+    def get_balance(self) -> Decimal:
+        """Capital TOTAL de la cuenta, incluido el valor de las posiciones abiertas.
+
+        No es el efectivo libre: abrir una posición no debe bajarlo. El motor lo
+        usa para dimensionar y para el pico de la protección de drawdown; con
+        efectivo libre, abrir posiciones parecería una pérdida de capital.
+        """
 
 
 class OrderExecutor(ABC):

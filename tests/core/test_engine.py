@@ -45,6 +45,7 @@ class RaisingSource(FakeSource):
 
 
 class FakeData(MarketDataSource):
+    # balance = capital TOTAL (contrato de get_balance): abrir posiciones no lo baja.
     def __init__(self, price=Decimal("100"), balance=Decimal("10000")):
         self.price = price
         self.balance = balance
@@ -463,3 +464,57 @@ def test_shutdown_audits_and_warns_about_discarded_signals(make_env):
     ev = [e for e in env.audit.events() if e.event == "signals_discarded_by_shutdown"]
     assert len(ev) == 1 and ev[0].payload["discarded"] == 2
     assert any(level is Level.WARNING and "2" in msg for msg, level in env.notifier.sent)
+
+
+def test_same_signal_reprocessed_with_a_different_now_does_not_duplicate(make_env):
+    # Caída tras abrir y antes de avanzar el cursor: al reiniciar llega la misma
+    # señal con otro reloj. El identificador no depende del reloj.
+    env = make_env()
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    from datetime import timedelta
+    r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW + timedelta(minutes=1))
+    assert r.opened == [] and len(env.repo.open_positions()) == 1
+    assert len(env.executor.orders) == 1
+    assert r.rejected[0][1] is RejectReason.DUPLICATE
+
+
+def test_failed_exit_is_retried_next_cycle_and_closes(make_env):
+    from datetime import timedelta
+    env = make_env(executor=FakeExecutor(fail=RuntimeError("exchange caído")))
+    open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    r1 = env.engine.run_exit_cycle(NOW)
+    assert r1.closed == [] and len(r1.errors) == 1
+    env.executor.fail = None
+    r2 = env.engine.run_exit_cycle(NOW + timedelta(minutes=1))
+    assert [p.exit_reason for p in r2.closed] == [ExitReason.STOP_LOSS]
+    assert r2.errors == [] and env.repo.open_positions() == []
+
+
+def test_failed_entry_is_retried_with_same_signal(make_env):
+    env = make_env(executor=FakeExecutor(fail=RuntimeError("x")))
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    env.executor.fail = None
+    r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert len(r.opened) == 1
+
+
+def test_protections_lookback_covers_streak_window_plus_pause(make_env):
+    from datetime import timedelta
+    env = make_env(cfg=make_cfg(protections={
+        "stop_loss_streak": 1, "streak_window_hours": 24, "streak_pause_hours": 48}))
+    seen = []
+    real = env.engine._portfolio.closed_positions_since
+    env.engine._portfolio.closed_positions_since = lambda since: (seen.append(since), real(since))[1]
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert seen == [NOW - timedelta(hours=72)]
+
+
+def test_stop_inside_window_blocks_for_the_whole_long_pause(make_env):
+    from datetime import timedelta
+    env = make_env(cfg=make_cfg(protections={
+        "stop_loss_streak": 1, "streak_window_hours": 24, "streak_pause_hours": 48}))
+    p = open_pos(env, "old", entry=100, symbol="ETH/USDT")
+    env.repo.close_position(p.id, Decimal("80"), ExitReason.STOP_LOSS, NOW - timedelta(hours=20))
+    r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert r.rejected[0][1] is RejectReason.STOP_LOSS_STREAK
