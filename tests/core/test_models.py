@@ -86,6 +86,7 @@ def test_enums_have_required_members():
     assert {m.name for m in RejectReason} == {
         "MAX_USD_PER_TOKEN", "MAX_OPEN_POSITIONS", "MAX_USD_PER_DAY", "HARD_CAP",
         "INVALID_QUOTE", "ZERO_QUANTITY", "NOT_IN_ALLOWLIST", "DUPLICATE",
+        "COOLDOWN", "STOP_LOSS_STREAK", "MAX_DRAWDOWN", "MAX_USD_PER_GROUP",
     }
 
 

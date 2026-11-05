@@ -83,6 +83,20 @@ class RiskConfig(_Strict):
     hard_max_order_usd: Decimal = Field(gt=0)
 
 
+class ProtectionsConfig(_Strict):
+    """Frecuencia y correlación: cuánto se insiste, no cuánto se arriesga por orden.
+
+    Un 0 desactiva la protección correspondiente; por defecto todas están apagadas.
+    """
+
+    cooldown_minutes: int = Field(default=0, ge=0)
+    stop_loss_streak: int = Field(default=0, ge=0)
+    streak_window_hours: int = Field(default=24, gt=0)
+    streak_pause_hours: int = Field(default=24, gt=0)
+    max_drawdown_pct: Decimal = Field(default=Decimal(0), ge=0, le=100)
+    max_usd_per_group: Decimal = Field(default=Decimal(0), ge=0)
+
+
 class CadenceConfig(_Strict):
     entry_cron: str = Field(min_length=1)
     exit_interval_seconds: int = Field(gt=0)
@@ -109,6 +123,10 @@ class BotConfig(_Strict):
     exits: ExitsConfig
     risk: RiskConfig
     cadence: CadenceConfig
+    protections: ProtectionsConfig = Field(default_factory=ProtectionsConfig)
+    # Grupos de símbolos correlacionados: nombre -> símbolos. Un símbolo fuera de
+    # todo grupo forma su propio grupo de uno.
+    groups: dict[str, list[str]] = Field(default_factory=dict)
     execution: dict[Market, ExecutionConfig] = Field(default_factory=dict, validate_default=True)
     allowlist: list[str] = Field(default_factory=list)
 
@@ -134,6 +152,15 @@ class BotConfig(_Strict):
 
     @model_validator(mode="after")
     def _check_cross_rules(self) -> BotConfig:
+        seen: dict[str, str] = {}
+        for name, symbols in self.groups.items():
+            for symbol in symbols:
+                if symbol in seen and seen[symbol] != name:
+                    raise ValueError(
+                        f"groups: el símbolo {symbol} está en más de un grupo "
+                        f"({seen[symbol]}, {name}); la exposición sería ambigua"
+                    )
+                seen[symbol] = name
         if self.mode is Mode.LIVE and self.exits.stop_loss_pct is None:
             raise ValueError("exits.stop_loss_pct es obligatorio en modo live")
         if self.sizing.strategy == "risk" and self.exits.stop_loss_pct is None:

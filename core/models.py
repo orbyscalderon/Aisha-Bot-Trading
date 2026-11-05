@@ -46,6 +46,10 @@ class RejectReason(StrEnum):
     ZERO_QUANTITY = "zero_quantity"
     NOT_IN_ALLOWLIST = "not_in_allowlist"
     DUPLICATE = "duplicate"
+    COOLDOWN = "cooldown"
+    STOP_LOSS_STREAK = "stop_loss_streak"
+    MAX_DRAWDOWN = "max_drawdown"
+    MAX_USD_PER_GROUP = "max_usd_per_group"
 
 
 @dataclass(frozen=True, slots=True)
