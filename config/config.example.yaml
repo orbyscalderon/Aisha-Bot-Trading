@@ -30,3 +30,7 @@ groups:
   # Símbolos que caen juntos. Uno que no aparezca aquí forma su propio grupo
   # de uno, así que el límite por grupo nunca es más laxo que el de por token.
   solana_memes: [BONK, WIF]
+cex:
+  # Activos del exchange que no cuentan para el capital (residuos ajenos al bot).
+  # Cuidado: listar USDT/USDC aquí quita ese efectivo del capital.
+  ignore_assets: []

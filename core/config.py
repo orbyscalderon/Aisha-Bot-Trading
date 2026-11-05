@@ -102,6 +102,12 @@ class CadenceConfig(_Strict):
     exit_interval_seconds: int = Field(gt=0)
 
 
+class CexConfig(_Strict):
+    # Activos que get_balance ignora al sumar el capital (residuos ajenos al bot,
+    # p. ej. tokens de Earn). Ojo: listar una stablecoin quita ese efectivo del capital.
+    ignore_assets: list[str] = Field(default_factory=list)
+
+
 class ExecutionConfig(_Strict):
     slippage_bps: int = Field(ge=0)
     fee_bps: int = Field(ge=0)
@@ -129,6 +135,7 @@ class BotConfig(_Strict):
     groups: dict[str, list[str]] = Field(default_factory=dict)
     execution: dict[Market, ExecutionConfig] = Field(default_factory=dict, validate_default=True)
     allowlist: list[str] = Field(default_factory=list)
+    cex: CexConfig = Field(default_factory=CexConfig)
 
     @field_validator("execution", mode="before")
     @classmethod

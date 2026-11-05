@@ -33,6 +33,10 @@ class _MarketMissing(QuoteUnavailable):
     """El par no existe en el exchange (no es un fallo transitorio)."""
 
 
+class _NoPrice(QuoteUnavailable):
+    """El par existe pero su ticker no trae precio utilizable (nulo o no positivo)."""
+
+
 def _to_decimal(value: Any, what: str) -> Decimal:
     """Convierte con Decimal(str(valor)): nunca Decimal(float)."""
     if value is None or isinstance(value, bool):
@@ -118,9 +122,11 @@ class CexDataSource(MarketDataSource):
     def _last_price(self, symbol: str) -> Decimal:
         ticker = self._call(self._client.fetch_ticker, symbol)
         raw = ticker.get("last") if isinstance(ticker, dict) else None
+        if raw is None:
+            raise _NoPrice(f"sin precio para {symbol}")
         price = _to_decimal(raw, f"precio de {symbol}")
         if price <= 0:
-            raise QuoteUnavailable(f"precio no positivo para {symbol}: {price}")
+            raise _NoPrice(f"precio no positivo para {symbol}: {price}")
         return price
 
     def get_quote(self, symbol: str) -> Quote:
@@ -134,8 +140,12 @@ class CexDataSource(MarketDataSource):
         posición bajaría esta cifra por debajo del pico persistido y la
         protección de drawdown bloquearía todas las entradas para siempre.
         Los activos no estables se valoran a su último precio contra USDT; si
-        alguno no se puede valorar se lanza QuoteUnavailable en vez de
-        infravalorar el capital en silencio.
+        alguno falla de forma transitoria se lanza QuoteUnavailable en vez de
+        infravalorar el capital (ver _asset_price para qué se omite).
+
+        `ignore_assets` se comprueba ANTES de la rama de stablecoins: listar
+        "USDT" ahí quita el efectivo del capital. Probablemente es lo que se
+        quiere, pero conviene saberlo.
         """
         balance = self._call(self._client.fetch_balance)
         totals = balance.get("total") if isinstance(balance, dict) else None
@@ -160,10 +170,18 @@ class CexDataSource(MarketDataSource):
     def _asset_price(self, asset: str) -> Decimal | None:
         """Precio en USD del activo, o None si no tiene mercado.
 
-        Sin mercado (BadSymbol o símbolo ausente de client.markets) el activo es
-        tenencia ajena al bot y se omite con un WARNING. Cualquier otro fallo
-        sobre un par que sí existe sigue siendo QuoteUnavailable: omitirlo a
-        ratos descalibraría el pico de la protección de drawdown.
+        Se omite con un WARNING (una vez por activo) el activo que no se puede
+        valorar de forma persistente: sin mercado (BadSymbol o símbolo ausente
+        de client.markets) o con el par listado pero sin precio (last nulo o no
+        positivo). El bot solo opera símbolos que sabe cotizar, así que ese
+        activo es tenencia ajena. Cualquier otro fallo sobre un par que existe
+        (red, límite de tasa agotado, respuesta ilegible) sigue lanzando
+        QuoteUnavailable: omitirlo a ratos descalibraría el pico de drawdown.
+
+        Coste aceptado: si un par listado devuelve precio nulo de forma
+        transitoria por un fallo puntual del exchange, se omite en silencio y la
+        base de capital se mueve un poco mientras dure; la alternativa es que el
+        bot deje de operar por completo por un activo que ni es suyo.
         """
         markets = getattr(self._client, "markets", None)
         for quote in _QUOTE_ASSETS:
@@ -172,7 +190,7 @@ class CexDataSource(MarketDataSource):
                 continue
             try:
                 return self._last_price(symbol)
-            except _MarketMissing:
+            except (_MarketMissing, _NoPrice):
                 continue
         if asset not in self._warned_assets:
             self._warned_assets.add(asset)

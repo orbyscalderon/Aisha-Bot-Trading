@@ -224,14 +224,6 @@ def test_get_balance_ignore_assets_skips_without_pricing():
     assert source(client, ignore_assets=["DUST"]).get_balance() == Decimal("10")
 
 
-def test_get_balance_fails_when_an_asset_cannot_be_priced():
-    # no se infravalora el capital en silencio
-    balance = {"total": {"USDT": 10, "ZZZ": 5}}
-    client = FakeCcxt(balance=balance, tickers={"ZZZ/USDT": {"last": None}})
-    with pytest.raises(QuoteUnavailable):
-        source(client).get_balance()
-
-
 def write_csv(tmp_path, rows):
     path = tmp_path / "signals.csv"
     lines = ["timestamp,trader_id,symbol,side,amount_usd"] + rows
@@ -277,3 +269,51 @@ def test_csv_source_lists_followed_traders(tmp_path):
     src = CexCsvSignalSource(write_csv(tmp_path, two_rows()))
     assert src.list_followed() == ["t1"]
     assert src.name == "cex"
+
+
+def test_get_balance_skips_listed_pair_with_null_price_and_warns_once(caplog):
+    # el par existe pero su ticker no tiene precio: mercado muerto, persistente
+    balance = {"total": {"USDT": 10, "DEAD": 5}}
+    client = FakeCcxt(
+        balance=balance,
+        markets={"DEAD/USDT": {}},
+        tickers={"DEAD/USDT": {"last": None}},
+    )
+    src = source(client)
+    with caplog.at_level("WARNING"):
+        assert src.get_balance() == Decimal("10")
+        assert src.get_balance() == Decimal("10")
+    assert len([r for r in caplog.records if "DEAD" in r.getMessage()]) == 1
+
+
+def test_get_balance_skips_listed_pair_with_zero_price():
+    balance = {"total": {"USDT": 10, "DEAD": 5}}
+    client = FakeCcxt(
+        balance=balance, markets={"DEAD/USDT": {}}, tickers={"DEAD/USDT": {"last": "0"}}
+    )
+    assert source(client).get_balance() == Decimal("10")
+
+
+@pytest.mark.parametrize("error", [ccxt.NetworkError, ccxt.RateLimitExceeded, OSError])
+def test_get_balance_transient_errors_on_listed_pair_still_raise(error):
+    balance = {"total": {"USDT": 10, "BTC": 1}}
+    client = FakeCcxt(
+        balance=balance, markets={"BTC/USDT": {}}, tickers={"BTC/USDT": error}
+    )
+    with pytest.raises(QuoteUnavailable):
+        source(client).get_balance()
+
+
+def test_get_balance_unreadable_price_on_listed_pair_still_raises():
+    balance = {"total": {"USDT": 10, "BTC": 1}}
+    client = FakeCcxt(
+        balance=balance, markets={"BTC/USDT": {}}, tickers={"BTC/USDT": {"last": "abc"}}
+    )
+    with pytest.raises(QuoteUnavailable):
+        source(client).get_balance()
+
+
+def test_keyboard_interrupt_is_not_swallowed():
+    client = FakeCcxt(fail_times=99, error=KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        source(client).get_quote("X/USDT")

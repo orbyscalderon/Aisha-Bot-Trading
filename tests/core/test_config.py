@@ -314,3 +314,24 @@ def test_paper_does_not_require_protections_section(yaml_with):
     data = copy.deepcopy(BASE)
     data.pop("protections", None)
     assert load_config(yaml_with(raw=data)).mode.value == "paper"
+
+
+def test_cex_ignore_assets_defaults_to_empty(yaml_with):
+    assert load_config(yaml_with()).cex.ignore_assets == []
+
+
+def test_cex_ignore_assets_accepts_a_list(yaml_with):
+    data = copy.deepcopy(BASE)
+    data["cex"] = {"ignore_assets": ["LDBTC", "FAUCET"]}
+    assert load_config(yaml_with(raw=data)).cex.ignore_assets == ["LDBTC", "FAUCET"]
+
+
+def test_cex_section_rejects_unknown_keys(yaml_with):
+    data = copy.deepcopy(BASE)
+    data["cex"] = {"ignore_asset": ["X"]}
+    with pytest.raises(ConfigError):
+        load_config(yaml_with(raw=data))
+
+
+def test_example_config_documents_cex_ignore_assets():
+    assert load_config(Path("config/config.example.yaml")).cex.ignore_assets == []
