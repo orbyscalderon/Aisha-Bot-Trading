@@ -454,3 +454,17 @@ def test_paper_balance_is_simulated_not_the_real_account(paper_yaml, root):
     engine = build_engine(load_config(paper_yaml), root, data_source=RealAccount(),
                           paper_capital=Decimal(5000))
     assert engine._data.get_balance() == Decimal(5000)
+
+
+def test_build_engine_passes_ignore_assets_to_the_cex_adapter(tmp_path, root, monkeypatch):
+    seen = {}
+
+    class SpyCex(FakeData):
+        def __init__(self, exchange_id, *args, **kwargs):
+            seen["exchange_id"] = exchange_id
+            seen["ignore_assets"] = kwargs.get("ignore_assets")
+
+    monkeypatch.setattr(cli, "CexDataSource", SpyCex)
+    p = write_yaml(tmp_path / "cex.yaml", cex={"ignore_assets": ["LDBNB", "FAUCET"]})
+    build_engine(load_config(p), root, notifier=RecordingNotifier())
+    assert list(seen["ignore_assets"]) == ["LDBNB", "FAUCET"]

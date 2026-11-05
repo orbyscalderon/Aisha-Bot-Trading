@@ -133,7 +133,7 @@ def _build(
     # acceso está serializado por el cerrojo de ``build_jobs``.
     conn = init_db(root / f"{config.mode.value}.db", check_same_thread=False)
     repo = Repository(conn)
-    raw_data = data_source if data_source is not None else CexDataSource(exchange_id)
+    raw_data = data_source if data_source is not None else CexDataSource(exchange_id, ignore_assets=config.cex.ignore_assets)
     data = PaperCapitalSource(raw_data, repo, paper_capital)
     exec_cfg = config.execution[Market.CEX]
     executor = PaperExecutor(
