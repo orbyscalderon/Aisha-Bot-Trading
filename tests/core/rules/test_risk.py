@@ -1,16 +1,14 @@
+import inspect
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime, timezone
+from datetime import date
 from decimal import Decimal
 
 import pytest
 
 from core.config import RiskConfig
-from core.models import Fill, Market, Position, RejectReason, Side
+from core.models import RejectReason
 from core.rules.risk import RiskAction, RiskState, build_risk_state, evaluate_risk
-from storage.db import init_db
-from storage.repository import Repository
 
-UTC = timezone.utc
 D = date(2026, 11, 4)
 
 
@@ -34,22 +32,6 @@ def state(exposure=None, open_count=0, spent=Decimal("0"), realized=Decimal("0")
 
 def empty_state():
     return state()
-
-
-@pytest.fixture
-def repo(tmp_path):
-    c = init_db(tmp_path / "bot.db")
-    yield Repository(c)
-    c.close()
-
-
-def fill_at(ts, amount, id=None, side=Side.BUY, price=Decimal("100"), position_id=None,
-            fee=Decimal("0")):
-    return Fill(
-        id=id or f"f-{ts.isoformat()}-{side.value}", client_order_id=f"c-{ts.isoformat()}-{side.value}",
-        market=Market.CEX, symbol="BTC/USDT", side=side, price=price,
-        quantity=Decimal(amount) / price, fee_usd=fee, timestamp=ts, position_id=position_id,
-    )
 
 
 def test_allows_order_within_all_limits():
@@ -131,48 +113,28 @@ def test_risk_state_is_frozen():
         empty_state().spent_usd_today = Decimal("1")
 
 
-def test_build_risk_state_uses_fixed_utc_day_not_now(repo):
-    # Review Focus 2: el día se fija al inicio del ciclo, no se vuelve a leer
-    repo.save_fill(fill_at(datetime(2026, 11, 4, 23, 59, tzinfo=UTC), Decimal("100")))
-    repo.save_fill(fill_at(datetime(2026, 11, 5, 0, 1, tzinfo=UTC), Decimal("700")))
-    assert build_risk_state(repo, date(2026, 11, 4), {}, 0).spent_usd_today == Decimal("100")
+def test_build_risk_state_assembles_aggregates_from_caller():
+    # Portfolio (Tarea 11) es el único dueño de la agregación; esto solo ensambla
+    s = build_risk_state(
+        D, {"BTC/USDT": Decimal("80")}, 3,
+        spent_usd_today=Decimal("200"), realized_pnl_usd_today=Decimal("-81"),
+    )
+    assert s == RiskState(
+        utc_day=D, spent_usd_today=Decimal("200"), realized_pnl_usd_today=Decimal("-81"),
+        open_position_count=3, exposure_by_symbol={"BTC/USDT": Decimal("80")},
+    )
 
 
-def test_build_risk_state_day_window_is_half_open(repo):
-    repo.save_fill(fill_at(datetime(2026, 11, 4, 0, 0, tzinfo=UTC), Decimal("10")))
-    repo.save_fill(fill_at(datetime(2026, 11, 5, 0, 0, tzinfo=UTC), Decimal("90")))
-    s = build_risk_state(repo, D, {}, 0)
-    assert s.spent_usd_today == Decimal("10") and s.utc_day == D
+def test_build_risk_state_takes_no_repository():
+    params = inspect.signature(build_risk_state).parameters
+    assert "repo" not in params
+    assert "spent_usd_today" in params and "realized_pnl_usd_today" in params
 
 
-def test_build_risk_state_takes_exposure_from_caller(repo):
-    # la exposición la agrega Portfolio (Tarea 11), no esta función: una sola agregación
-    s = build_risk_state(repo, D, {"BTC/USDT": Decimal("80")}, 3)
-    assert s.exposure_by_symbol == {"BTC/USDT": Decimal("80")} and s.open_position_count == 3
-
-
-def test_build_risk_state_empty_day_is_zero(repo):
-    s = build_risk_state(repo, D, {}, 0)
-    assert s.spent_usd_today == 0 and s.realized_pnl_usd_today == 0
-
-
-def test_build_risk_state_realized_pnl_from_sells(repo):
-    repo.save_position(Position(
-        id="p1", signal_id="s1", trader_id="t1", market=Market.CEX, symbol="BTC/USDT",
-        entry_price=Decimal("100"), quantity=Decimal("2"), amount_usd=Decimal("200"),
-        opened_at=datetime(2026, 11, 4, 9, 0, tzinfo=UTC), peak_price=Decimal("100"),
-    ))
-    repo.save_fill(fill_at(datetime(2026, 11, 4, 9, 0, tzinfo=UTC), Decimal("200")))
-    # vende 2 a 60: pierde 80, más 1 de comisión
-    repo.save_fill(fill_at(datetime(2026, 11, 4, 10, 0, tzinfo=UTC), Decimal("120"),
-                           side=Side.SELL, price=Decimal("60"), position_id="p1", fee=Decimal("1")))
-    s = build_risk_state(repo, D, {}, 0)
-    assert s.realized_pnl_usd_today == Decimal("-81")
-    assert s.spent_usd_today == Decimal("200")  # solo cuentan las compras
-
-
-def test_build_risk_state_sell_without_position_fails_loudly(repo):
-    repo.save_fill(fill_at(datetime(2026, 11, 4, 10, 0, tzinfo=UTC), Decimal("60"),
-                           side=Side.SELL, position_id=None))
-    with pytest.raises(ValueError, match="unknown position"):
-        build_risk_state(repo, D, {}, 0)
+def test_build_risk_state_copies_exposure_read_only():
+    exposure = {"BTC/USDT": Decimal("80")}
+    s = build_risk_state(D, exposure, 1, Decimal("0"), Decimal("0"))
+    exposure["BTC/USDT"] = Decimal("999")
+    assert s.exposure_by_symbol["BTC/USDT"] == Decimal("80")
+    with pytest.raises(TypeError):
+        s.exposure_by_symbol["ETH/USDT"] = Decimal("1")

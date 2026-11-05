@@ -19,23 +19,22 @@ total exactamente en el límite se permite; solo se rechaza lo que lo supera.
 
 ``build_risk_state`` recibe el día UTC por parámetro y no lee el reloj: quien
 llama lo fija una sola vez al inicio del ciclo, para que un cambio de día a
-mitad de ciclo no mueva la contabilidad. La exposición y el número de posiciones
-abiertas también llegan por parámetro: los agrega ``Portfolio``, y tener dos
-agregaciones de lo mismo en dos sitios es garantía de que diverjan.
+mitad de ciclo no mueva la contabilidad. Exposición, recuento de posiciones,
+gasto y PnL realizado también llegan por parámetro: los agrega ``Portfolio``,
+y tener dos agregaciones de lo mismo en dos sitios es garantía de que diverjan.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 
 from core.config import RiskConfig
-from core.models import RejectReason, Side
-from storage.repository import Repository
+from core.models import RejectReason
 
 _ZERO = Decimal(0)
 
@@ -93,38 +92,21 @@ def evaluate_risk(
 
 
 def build_risk_state(
-    repo: Repository,
     utc_day: date,
     exposure_by_symbol: Mapping[str, Decimal],
     open_position_count: int,
+    spent_usd_today: Decimal,
+    realized_pnl_usd_today: Decimal,
 ) -> RiskState:
-    """Estado de riesgo del día ``utc_day`` (ventana UTC semiabierta).
+    """Ensambla el ``RiskState`` del día ``utc_day``. No lee nada.
 
-    Gasto: nocional (precio x cantidad) de las compras del día.
-    PnL realizado: por cada venta, (precio - entrada de su posición) x cantidad;
-    menos las comisiones de todos los fills del día (conservador: las de entrada
-    también son dinero perdido).
+    Todos los agregados (exposición, recuento, gasto y PnL realizado) los calcula
+    ``Portfolio``, único dueño de la agregación sobre fills y posiciones.
     """
-    start = datetime.combine(utc_day, time.min, tzinfo=timezone.utc)
-    fills = repo.fills_between(start, start + timedelta(days=1))
-
-    spent = _ZERO
-    realized = _ZERO
-    for f in fills:
-        realized -= f.fee_usd
-        if f.side is Side.BUY:
-            spent += f.price * f.quantity
-            continue
-        position = repo.get_position(f.position_id) if f.position_id is not None else None
-        if position is None:
-            # Un PnL calculado a ciegas podría ocultar una pérdida: fallar alto.
-            raise ValueError(f"sell fill {f.id!r} references unknown position {f.position_id!r}")
-        realized += (f.price - position.entry_price) * f.quantity
-
     return RiskState(
         utc_day=utc_day,
-        spent_usd_today=spent,
-        realized_pnl_usd_today=realized,
+        spent_usd_today=spent_usd_today,
+        realized_pnl_usd_today=realized_pnl_usd_today,
         open_position_count=open_position_count,
         exposure_by_symbol=MappingProxyType(dict(exposure_by_symbol)),
     )
