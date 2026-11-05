@@ -13,6 +13,7 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from core.idempotency import IntentStatus, OrderIntent
 from core.models import ExitReason, Fill, Market, Position, Side
 
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%f+00:00"
@@ -178,3 +179,83 @@ class Repository:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"allowlist already frozen for session {session_id!r}") from exc
+
+    # --- intenciones de orden (idempotencia) -----------------------------
+
+    def reserve_intent(
+        self, client_order_id: str, payload: dict, now: datetime | None = None
+    ) -> bool:
+        """Reserva el identificador antes de salir a la red.
+
+        Se apoya en la PRIMARY KEY: intenta el INSERT y devuelve False si ya
+        existía. Un SELECT previo dejaría una ventana de carrera.
+        """
+        created = _ts(now if now is not None else datetime.now(timezone.utc))
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO order_intents (client_order_id, status, payload, created_at)"
+                    " VALUES (?,?,?,?)",
+                    (
+                        client_order_id, IntentStatus.RESERVED.value,
+                        json.dumps(payload, sort_keys=True, default=str), created,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def _transition_intent(
+        self, client_order_id: str, new: IntentStatus, allowed_from: tuple[IntentStatus, ...],
+        error: str | None = None,
+    ) -> None:
+        marks = ",".join("?" * len(allowed_from))
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE order_intents SET status = ?, error = ?"
+                f" WHERE client_order_id = ? AND status IN ({marks})",
+                (new.value, error, client_order_id, *(s.value for s in allowed_from)),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(
+                    f"intent {client_order_id!r} not found or cannot move to {new.value}"
+                    f" (allowed from: {', '.join(s.value for s in allowed_from)})"
+                )
+
+    def mark_intent_sent(self, client_order_id: str) -> None:
+        """RESERVED -> SENT. ValueError si no existe o no estaba RESERVED."""
+        self._transition_intent(client_order_id, IntentStatus.SENT, (IntentStatus.RESERVED,))
+
+    def mark_intent_confirmed(self, client_order_id: str, fill: Fill) -> None:
+        """RESERVED|SENT -> CONFIRMED. El fill debe pertenecer a esta orden."""
+        if fill.client_order_id != client_order_id:
+            raise ValueError(
+                f"fill {fill.id!r} belongs to {fill.client_order_id!r}, not {client_order_id!r}"
+            )
+        self._transition_intent(
+            client_order_id, IntentStatus.CONFIRMED, (IntentStatus.RESERVED, IntentStatus.SENT)
+        )
+
+    def mark_intent_failed(self, client_order_id: str, error: str) -> None:
+        """RESERVED|SENT -> FAILED, con el motivo."""
+        self._transition_intent(
+            client_order_id, IntentStatus.FAILED,
+            (IntentStatus.RESERVED, IntentStatus.SENT), error,
+        )
+
+    def unconfirmed_intents(self) -> list[OrderIntent]:
+        """Intenciones RESERVED o SENT (resultado incierto), por antigüedad."""
+        rows = self._conn.execute(
+            "SELECT * FROM order_intents WHERE status IN (?, ?) ORDER BY created_at, rowid",
+            (IntentStatus.RESERVED.value, IntentStatus.SENT.value),
+        ).fetchall()
+        return [
+            OrderIntent(
+                client_order_id=r["client_order_id"],
+                status=IntentStatus(r["status"]),
+                payload=json.loads(r["payload"]),
+                created_at=_parse_ts(r["created_at"]),
+                error=r["error"],
+            )
+            for r in rows
+        ]
