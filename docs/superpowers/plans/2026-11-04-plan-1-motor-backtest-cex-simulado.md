@@ -446,16 +446,31 @@ def test_take_profit_triggers_above_threshold():
     assert d.reason is ExitReason.TAKE_PROFIT
 
 def test_trailing_uses_peak_not_entry():
-    # pico 200, trailing 10% -> cierra en 179 aunque siga por encima de la entrada
+    # pico 200 -> armado, porque +100% supera el tp de 30%.
+    # trailing_pct 10 -> cierra por debajo de 200*0.9 = 180.
     d = evaluate_exit(pos(entry=100, peak=200), q(179), T1,
-                      cfg(primary="take_profit", tp_pct=30, trailing=True), None)
+                      cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None)
     assert d.reason is ExitReason.TAKE_PROFIT
+
+def test_trailing_holds_above_the_retrace_threshold():
+    # 181 sigue por encima de 180: no se devuelve suficiente, no cierra
+    assert evaluate_exit(pos(entry=100, peak=200), q(181), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
+
+def test_trailing_not_armed_below_take_profit_threshold():
+    # pico 120 = +20%, no alcanza el tp de 30%: el trailing no está armado y no cierra
+    assert evaluate_exit(pos(entry=100, peak=120), q(100), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
 
 def test_trailing_disabled_by_default():
     assert cfg(primary="take_profit", tp_pct=30).trailing is False
 
+def test_trailing_requires_trailing_pct_in_config():
+    with pytest.raises(ConfigError, match="trailing_pct"):
+        load_config(yaml_with(primary="take_profit", take_profit_pct=30, trailing=True, trailing_pct=None))
+
 def test_time_stop_triggers_after_hours():
-    d = evaluate_exit(pos(opened_at=T0), q(100), T0 + timedelta(hours=49), T1,
+    d = evaluate_exit(pos(opened_at=T0), q(100), T0 + timedelta(hours=49),
                       cfg(primary="time_stop", time_stop_hours=48), None)
     assert d.reason is ExitReason.TIME_STOP
 
@@ -495,7 +510,16 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `evaluate_exit` y `next_peak_price` en `core/rules/exits.py`**
 
-Función pura. Evalúa en el orden fijo del spec §4.4 y devuelve en la primera coincidencia: stop-loss, copy-sell, take-profit (con trailing desde `peak_price` si está activo, desde `entry_price` si no), time-stop. Las condiciones 2–4 solo se consideran si coinciden con `cfg.primary`, salvo el time-stop, que actúa también como red de seguridad cuando `time_stop_hours` está configurado. Los umbrales se cruzan con desigualdad estricta.
+Función pura. Evalúa en el orden fijo del spec §4.4 y devuelve en la primera coincidencia: stop-loss, copy-sell, take-profit, time-stop.
+
+**Semántica del take-profit, con y sin trailing.** Son dos números distintos y no deben confundirse:
+
+- `trailing: false` — cierra cuando el precio sube más de `take_profit_pct` sobre la entrada.
+- `trailing: true` — `take_profit_pct` pasa a ser el umbral de **armado**: el trailing se activa cuando el **pico** supera ese porcentaje sobre la entrada. Una vez armado, cierra cuando el precio cae más de `trailing_pct` desde el pico. Antes de armarse no cierra nunca por esta vía.
+
+Reutilizar `take_profit_pct` como distancia de retroceso sería un error: con un take-profit del 30 % y pico en 200 desde una entrada de 100, saldrías en 140, devolviendo 60 de los 100 ganados. Son preguntas distintas: cuánto beneficio hace falta para interesarse, y cuánto se está dispuesto a devolver.
+
+**Esta tarea añade `trailing_pct: Decimal | None` a `ExitsConfig`** en `core/config.py`, en el rango (0, 100], con la regla cruzada de que `trailing: true` lo exige. Mismo criterio que la Tarea 4 con `risk_pct`: la Tarea 2 está cerrada y una funcionalidad tiene una sola dueña. Las condiciones 2–4 solo se consideran si coinciden con `cfg.primary`, salvo el time-stop, que actúa también como red de seguridad cuando `time_stop_hours` está configurado. Los umbrales se cruzan con desigualdad estricta.
 
 - [ ] **Step 4: Run test to verify it passes**
 
