@@ -29,7 +29,7 @@ def yaml_with(tmp_path):
 
     def _make(mode=None, stop_loss_pct="keep", strategy=None, mirror_pct=None,
               mirror_cap_usd=None, primary="keep", hard_max_order_usd=None,
-              cex_slippage=None, raw=None):
+              cex_slippage=None, risk_pct=None, raw=None):
         data = copy.deepcopy(BASE) if raw is None else raw
         if raw is None:
             if mode is not None:
@@ -40,6 +40,7 @@ def yaml_with(tmp_path):
                 data["sizing"]["strategy"] = strategy
                 data["sizing"]["mirror_pct"] = mirror_pct
                 data["sizing"]["mirror_cap_usd"] = mirror_cap_usd
+                data["sizing"]["risk_pct"] = risk_pct
             if primary != "keep":
                 data["exits"]["primary"] = primary
             if hard_max_order_usd is not None:
@@ -225,3 +226,32 @@ def test_unknown_root_key_is_rejected(yaml_with):
     data["modee"] = "live"
     with pytest.raises(ConfigError, match="modee"):
         load_config(yaml_with(raw=data))
+
+
+# --- estrategia `risk` (spec §4.3.1) ---
+
+def test_risk_strategy_requires_risk_pct(yaml_with):
+    with pytest.raises(ConfigError, match="risk_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=None, stop_loss_pct=15))
+
+
+def test_risk_strategy_requires_stop_loss(yaml_with):
+    with pytest.raises(ConfigError, match="stop_loss_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=1, stop_loss_pct=None))
+
+
+def test_risk_strategy_loads_with_pct_and_stop(yaml_with):
+    cfg = load_config(yaml_with(strategy="risk", risk_pct="0.5", stop_loss_pct=15))
+    assert cfg.sizing.strategy == "risk"
+    assert cfg.sizing.risk_pct == Decimal("0.5")
+
+
+@pytest.mark.parametrize("bad", [0, -1, 100.5])
+def test_risk_pct_must_be_in_zero_exclusive_to_hundred(yaml_with, bad):
+    with pytest.raises(ConfigError, match="risk_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=bad, stop_loss_pct=15))
+
+
+def test_risk_pct_of_hundred_is_accepted(yaml_with):
+    cfg = load_config(yaml_with(strategy="risk", risk_pct=100, stop_loss_pct=15))
+    assert cfg.sizing.risk_pct == Decimal("100")

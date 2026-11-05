@@ -29,10 +29,11 @@ class _Strict(BaseModel):
 
 
 class SizingConfig(_Strict):
-    strategy: Literal["flat", "mirror"]
+    strategy: Literal["flat", "mirror", "risk"]
     flat_amount_usd: Decimal | None = Field(default=None, gt=0)
     mirror_pct: Decimal | None = Field(default=None, gt=0, le=100)
     mirror_cap_usd: Decimal | None = Field(default=None, gt=0)
+    risk_pct: Decimal | None = Field(default=None, gt=0, le=100)
 
     @model_validator(mode="after")
     def _check_strategy(self) -> SizingConfig:
@@ -43,6 +44,8 @@ class SizingConfig(_Strict):
                 raise ValueError("sizing.mirror_pct es obligatorio con strategy=mirror")
             if self.mirror_cap_usd is None:
                 raise ValueError("sizing.mirror_cap_usd es obligatorio con strategy=mirror")
+        if self.strategy == "risk" and self.risk_pct is None:
+            raise ValueError("sizing.risk_pct es obligatorio con strategy=risk")
         return self
 
 
@@ -124,6 +127,8 @@ class BotConfig(_Strict):
     def _check_cross_rules(self) -> BotConfig:
         if self.mode is Mode.LIVE and self.exits.stop_loss_pct is None:
             raise ValueError("exits.stop_loss_pct es obligatorio en modo live")
+        if self.sizing.strategy == "risk" and self.exits.stop_loss_pct is None:
+            raise ValueError("exits.stop_loss_pct es obligatorio con sizing.strategy=risk: sin stop no hay distancia que medir")
         return self
 
     def fingerprint(self) -> str:
