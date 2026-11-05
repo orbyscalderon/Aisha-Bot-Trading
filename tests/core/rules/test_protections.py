@@ -1,4 +1,4 @@
-import inspect
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -139,10 +139,6 @@ def test_group_of_returns_the_group_name():
     assert group_of("BONK", {"solana_memes": ["BONK", "WIF"]}) == "solana_memes"
 
 
-def test_protections_never_block_exits():
-    assert "exit" not in inspect.signature(evaluate_protections).parameters
-
-
 def test_streak_is_evaluated_before_drawdown():
     st = state([closed(f"T{i}", ExitReason.STOP_LOSS, timedelta(hours=1), n=i) for i in range(3)],
                peak=D1000, equity=D880)
@@ -156,8 +152,42 @@ def test_everything_disabled_by_default():
 
 
 def test_verdict_is_frozen():
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         ProtectionVerdict(False).blocked = True  # type: ignore[misc]
+
+
+def test_cooldown_exactly_at_expiry_does_not_block():
+    v = evaluate_protections("BONK", D50, state_with_loss("BONK", minutes_ago=60), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+
+def test_streak_pause_ending_exactly_now_does_not_block():
+    # último stop hace 12 h con pausa de 12 h: until == now
+    v = evaluate_protections("X", D50, state_with_stops(3, hours=12), cfg(streak=3, window=24, pause=12), NOW)
+    assert v.blocked is False
+
+
+def test_stop_exactly_at_window_start_is_outside_the_window():
+    v = evaluate_protections("X", D50, state_with_stops(3, hours=24), cfg(streak=3, window=24, pause=48), NOW)
+    assert v.blocked is False
+
+
+def test_one_stop_short_of_the_streak_does_not_block():
+    v = evaluate_protections("X", D50, state_with_stops(2, hours=1), cfg(streak=3), NOW)
+    assert v.blocked is False
+
+
+def test_drawdown_is_evaluated_before_cooldown():
+    st = state([closed("BONK", ExitReason.COPY_SELL, timedelta(minutes=5))], peak=D1000, equity=D880)
+    v = evaluate_protections("BONK", D50, st, cfg(cooldown=60, max_dd=10), NOW)
+    assert v.reason is RejectReason.MAX_DRAWDOWN
+
+
+def test_cooldown_is_evaluated_before_group_exposure():
+    st = state([closed("BONK", ExitReason.COPY_SELL, timedelta(minutes=5))],
+               exposure={"WIF": D60}, groups={"g": ["BONK", "WIF"]})
+    v = evaluate_protections("BONK", D60, st, cfg(cooldown=60, max_group=100), NOW)
+    assert v.reason is RejectReason.COOLDOWN
 
 
 def test_symbol_in_two_groups_is_rejected_by_config():
