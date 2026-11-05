@@ -255,3 +255,10 @@ def test_risk_pct_must_be_in_zero_exclusive_to_hundred(yaml_with, bad):
 def test_risk_pct_of_hundred_is_accepted(yaml_with):
     cfg = load_config(yaml_with(strategy="risk", risk_pct=100, stop_loss_pct=15))
     assert cfg.sizing.risk_pct == Decimal("100")
+
+
+def test_mirror_strategy_requires_flat_amount_as_fallback(yaml_with):
+    raw = copy.deepcopy(BASE)
+    raw["sizing"] = {"strategy": "mirror", "mirror_pct": 10, "mirror_cap_usd": 200}
+    with pytest.raises(ConfigError, match="flat_amount_usd"):
+        load_config(yaml_with(raw=raw))

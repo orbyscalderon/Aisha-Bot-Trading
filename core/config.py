@@ -44,6 +44,11 @@ class SizingConfig(_Strict):
                 raise ValueError("sizing.mirror_pct es obligatorio con strategy=mirror")
             if self.mirror_cap_usd is None:
                 raise ValueError("sizing.mirror_cap_usd es obligatorio con strategy=mirror")
+            if self.flat_amount_usd is None:
+                raise ValueError(
+                    "sizing.flat_amount_usd es obligatorio con strategy=mirror: "
+                    "mirror requiere flat_amount_usd como respaldo cuando el trader no reporta importe"
+                )
         if self.strategy == "risk" and self.risk_pct is None:
             raise ValueError("sizing.risk_pct es obligatorio con strategy=risk")
         return self
