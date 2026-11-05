@@ -338,10 +338,17 @@ def test_risk_sizes_so_stop_loses_the_declared_fraction():
     assert calculate_size(sig, risk_cfg(pct=1), ctx).amount_usd == Decimal("64.93")
 
 def test_risk_scales_with_equity():
-    # el doble de capital, el doble de importe
+    # El doble de capital da el doble de importe, salvo un céntimo de redondeo:
+    # ROUND_DOWN no se reparte sobre la multiplicación (64.93*2 = 129.86, pero 20/0.154 = 129.87).
     big = calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("2000"))).amount_usd
     small = calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("1000"))).amount_usd
-    assert big == small * 2
+    assert abs(big - small * 2) <= Decimal("0.01")
+
+def test_risk_scales_exactly_when_division_is_clean():
+    # stop 20%, sin deslizamiento ni comisiones -> fracción 0.2, divide exacto
+    ctx = lambda e: SizingContext(equity_usd=e, stop_loss_pct=Decimal("20"), slippage_bps=0, fee_bps=0)
+    assert calculate_size(sig, risk_cfg(pct=1), ctx(Decimal("2000"))).amount_usd == \
+           calculate_size(sig, risk_cfg(pct=1), ctx(Decimal("1000"))).amount_usd * 2
 
 def test_risk_sizes_smaller_when_stop_is_wider():
     # un stop más lejano exige una posición más pequeña para arriesgar lo mismo
