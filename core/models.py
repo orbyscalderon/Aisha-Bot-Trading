@@ -80,6 +80,10 @@ class Order:
     side: Side
     amount_usd: Decimal
     reference_price: Decimal
+    # Convenio: una compra lleva amount_usd y deja position_id/quantity en None.
+    # Una venta lleva position_id y quantity (cantidad de esa posición).
+    position_id: str | None = None
+    quantity: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +97,8 @@ class Fill:
     quantity: Decimal
     fee_usd: Decimal
     timestamp: datetime
+    # None en el fill de apertura: la posición aún no existe.
+    position_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

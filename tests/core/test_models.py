@@ -119,3 +119,60 @@ def test_quote_and_order_and_fill_construct_with_decimal_prices():
     )
     assert isinstance(fill.price, Decimal)
     assert fill.quantity * fill.price <= order.amount_usd
+
+
+def buy_order(**overrides) -> Order:
+    base = dict(
+        client_order_id="ct-1",
+        market=Market.CEX,
+        symbol="BTC/USDT",
+        side=Side.BUY,
+        amount_usd=Decimal("50"),
+        reference_price=Decimal("100"),
+    )
+    base.update(overrides)
+    return Order(**base)
+
+
+def base_fill(**overrides) -> Fill:
+    base = dict(
+        id="f1",
+        client_order_id="ct-1",
+        market=Market.CEX,
+        symbol="BTC/USDT",
+        side=Side.BUY,
+        price=Decimal("100"),
+        quantity=Decimal("0.5"),
+        fee_usd=Decimal("0.05"),
+        timestamp=T0,
+    )
+    base.update(overrides)
+    return Fill(**base)
+
+
+def test_buy_order_has_no_position_id_or_quantity():
+    order = buy_order()
+    assert order.position_id is None
+    assert order.quantity is None
+
+
+def test_sell_order_keeps_position_id_and_quantity():
+    order = buy_order(side=Side.SELL, position_id="p1",
+                      quantity=Decimal("0.5"))
+    assert order.position_id == "p1"
+    assert order.quantity == Decimal("0.5")
+
+
+def test_fill_without_position_id_is_none():
+    assert base_fill().position_id is None
+
+
+def test_fill_keeps_position_id():
+    assert base_fill(position_id="p1").position_id == "p1"
+
+
+def test_order_and_fill_position_fields_are_immutable():
+    with pytest.raises(FrozenInstanceError):
+        buy_order().position_id = "p2"
+    with pytest.raises(FrozenInstanceError):
+        base_fill().position_id = "p2"
