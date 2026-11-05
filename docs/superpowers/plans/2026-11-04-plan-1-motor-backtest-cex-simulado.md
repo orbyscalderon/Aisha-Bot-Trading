@@ -984,8 +984,9 @@ def test_negative_quote_rejects_without_opening():
     assert r.rejected[0][1] is RejectReason.INVALID_QUOTE
 
 def test_quantity_rounding_to_zero_rejects():
-    # Review Focus 3: 50 USD de un activo a 120000 con 4 decimales redondea a 0
-    r = engine_with(quote=Decimal("120000"), amount=Decimal("50"), precision=4) \
+    # Review Focus 3. Ojo con la aritmética: 50/120000 = 0.000416, que con 4 decimales
+    # es 0.0004 y NO es cero. Hace falta un importe menor: 5/120000 = 0.0000416 -> 0.0000.
+    r = engine_with(quote=Decimal("120000"), amount=Decimal("5"), precision=4) \
         .run_entry_cycle(FakeSource([sig("t1")]), NOW)
     assert r.rejected[0][1] is RejectReason.ZERO_QUANTITY
 
