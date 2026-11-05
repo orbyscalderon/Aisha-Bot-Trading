@@ -15,7 +15,10 @@ T1 = T0 + timedelta(minutes=5)
 class FakeCcxt:
     """Cliente falso: nunca toca la red."""
 
-    def __init__(self, ticker=None, fail_times=0, error=None, balance=None, tickers=None):
+    def __init__(
+        self, ticker=None, fail_times=0, error=None, balance=None, tickers=None, markets=None
+    ):
+        self.markets = markets
         self.ticker = ticker
         self.fail_times = fail_times
         self.error = error
@@ -28,17 +31,22 @@ class FakeCcxt:
         if self.call_count <= self.fail_times:
             raise self.error("boom")
         if symbol in self.tickers:
-            return self.tickers[symbol]
+            value = self.tickers[symbol]
+            if isinstance(value, type) and issubclass(value, Exception):
+                raise value("boom")
+            return value
         return self.ticker
 
     def fetch_balance(self):
         self.call_count += 1
+        if self.call_count <= self.fail_times:
+            raise self.error("boom")
         return self.balance
 
 
-def source(client, sleeps=None):
+def source(client, sleeps=None, **kwargs):
     rec = sleeps if sleeps is not None else []
-    return CexDataSource.from_client(client, sleep=rec.append)
+    return CexDataSource.from_client(client, sleep=rec.append, **kwargs)
 
 
 def test_get_quote_returns_decimal_from_last_price():
@@ -139,9 +147,81 @@ def test_get_balance_ignores_zero_assets_and_counts_stables():
 
 
 def test_get_balance_wraps_errors():
-    client = FakeCcxt(fail_times=99, error=ccxt.AuthenticationError)
+    # el balance es válido: solo el error de ccxt puede provocar la excepción
+    client = FakeCcxt(balance={"total": {"USDT": 1}}, fail_times=99, error=ccxt.AuthenticationError)
+    with pytest.raises(QuoteUnavailable) as info:
+        source(client).get_balance()
+    assert isinstance(info.value.__cause__, ccxt.AuthenticationError)
+
+
+@pytest.mark.parametrize("error", [TypeError, KeyError, ValueError, OSError])
+def test_get_quote_wraps_non_ccxt_exceptions(error):
+    client = FakeCcxt(fail_times=99, error=error)
+    with pytest.raises(QuoteUnavailable) as info:
+        source(client).get_quote("X/USDT")
+    assert isinstance(info.value.__cause__, error)
+    assert client.call_count == 1
+
+
+def test_get_balance_wraps_non_ccxt_exceptions():
+    client = FakeCcxt(balance={"total": {}}, fail_times=99, error=OSError)
     with pytest.raises(QuoteUnavailable):
         source(client).get_balance()
+
+
+def test_get_balance_treats_none_amounts_as_zero():
+    balance = {"total": {"USDT": 10, "BTC": None, "ETH": None}}
+    assert source(FakeCcxt(balance=balance)).get_balance() == Decimal("10")
+
+
+def test_get_balance_falls_back_to_other_quote_assets():
+    balance = {"total": {"USDT": 10, "ABC": 2}}
+    client = FakeCcxt(
+        balance=balance,
+        tickers={"ABC/USDT": ccxt.BadSymbol, "ABC/USDC": {"last": "3"}},
+    )
+    assert source(client).get_balance() == Decimal("16")
+
+
+def test_get_balance_skips_asset_without_market_and_warns_once(caplog):
+    balance = {"total": {"USDT": 10, "LDBTC": 5}}
+    client = FakeCcxt(
+        balance=balance,
+        markets={"BTC/USDT": {}},  # LDBTC no tiene ningún par
+        tickers={"LDBTC/USDT": {"last": "999"}},  # no debe consultarse
+    )
+    src = source(client)
+    with caplog.at_level("WARNING"):
+        assert src.get_balance() == Decimal("10")
+        assert src.get_balance() == Decimal("10")
+    warnings = [r for r in caplog.records if "LDBTC" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_get_balance_skips_asset_when_every_pair_raises_bad_symbol():
+    balance = {"total": {"USDT": 10, "FAUCET": 5}}
+    client = FakeCcxt(
+        balance=balance,
+        tickers={f"FAUCET/{q}": ccxt.BadSymbol for q in ("USDT", "USDC", "FDUSD", "BUSD")},
+    )
+    assert source(client).get_balance() == Decimal("10")
+
+
+def test_get_balance_transient_error_on_existing_pair_still_raises():
+    balance = {"total": {"USDT": 10, "BTC": 1}}
+    client = FakeCcxt(
+        balance=balance,
+        markets={"BTC/USDT": {}},
+        tickers={"BTC/USDT": ccxt.NetworkError},
+    )
+    with pytest.raises(QuoteUnavailable):
+        source(client).get_balance()
+
+
+def test_get_balance_ignore_assets_skips_without_pricing():
+    balance = {"total": {"USDT": 10, "DUST": 5}}
+    client = FakeCcxt(balance=balance, tickers={"DUST/USDT": ccxt.NetworkError})
+    assert source(client, ignore_assets=["DUST"]).get_balance() == Decimal("10")
 
 
 def test_get_balance_fails_when_an_asset_cannot_be_priced():

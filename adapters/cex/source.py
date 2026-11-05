@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import logging
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import ccxt
 
@@ -22,7 +23,14 @@ BACKOFF_CAP_SECONDS = 8.0
 
 # Activos que valen 1 USD; el resto se valora con su par contra USDT.
 _STABLES = frozenset({"USDT", "USDC", "USD", "BUSD", "FDUSD"})
-_QUOTE_ASSET = "USDT"
+# Pares contra los que se intenta valorar un activo, en este orden.
+_QUOTE_ASSETS = ("USDT", "USDC", "FDUSD", "BUSD")
+
+logger = logging.getLogger(__name__)
+
+
+class _MarketMissing(QuoteUnavailable):
+    """El par no existe en el exchange (no es un fallo transitorio)."""
 
 
 def _to_decimal(value: Any, what: str) -> Decimal:
@@ -48,6 +56,7 @@ class CexDataSource(MarketDataSource):
         *,
         sleep: Callable[[float], None] = time.sleep,
         max_attempts: int = MAX_ATTEMPTS,
+        ignore_assets: Iterable[str] = (),
     ) -> None:
         exchange_cls = getattr(ccxt, exchange_id, None)
         if exchange_id not in ccxt.exchanges or exchange_cls is None:
@@ -60,12 +69,20 @@ class CexDataSource(MarketDataSource):
         client = exchange_cls(config)
         if testnet:
             client.set_sandbox_mode(True)
-        self._init(client, sleep, max_attempts)
+        self._init(client, sleep, max_attempts, ignore_assets)
 
-    def _init(self, client: Any, sleep: Callable[[float], None], max_attempts: int) -> None:
+    def _init(
+        self,
+        client: Any,
+        sleep: Callable[[float], None],
+        max_attempts: int,
+        ignore_assets: Iterable[str] = (),
+    ) -> None:
         self._client = client
         self._sleep = sleep
         self._max_attempts = max_attempts
+        self._ignore_assets = frozenset(ignore_assets)
+        self._warned_assets: set[str] = set()
 
     @classmethod
     def from_client(
@@ -74,10 +91,11 @@ class CexDataSource(MarketDataSource):
         *,
         sleep: Callable[[float], None] = time.sleep,
         max_attempts: int = MAX_ATTEMPTS,
+        ignore_assets: Iterable[str] = (),
     ) -> "CexDataSource":
         """Construye la fuente con un cliente ya hecho (los tests no tocan la red)."""
         self = cls.__new__(cls)
-        self._init(client, sleep, max_attempts)
+        self._init(client, sleep, max_attempts, ignore_assets)
         return self
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
@@ -89,8 +107,12 @@ class CexDataSource(MarketDataSource):
                 if attempt == self._max_attempts - 1:
                     raise QuoteUnavailable(f"límite de tasa agotado: {exc}") from exc
                 self._sleep(min(BACKOFF_BASE_SECONDS * 2**attempt, BACKOFF_CAP_SECONDS))
+            except ccxt.BadSymbol as exc:
+                raise _MarketMissing(f"el mercado no existe: {exc}") from exc
             except ccxt.BaseError as exc:
                 raise QuoteUnavailable(f"error de ccxt: {exc}") from exc
+            except Exception as exc:  # parseo interno de ccxt, sockets...
+                raise QuoteUnavailable(f"error inesperado: {exc!r}") from exc
         raise QuoteUnavailable("sin intentos disponibles")  # max_attempts <= 0
 
     def _last_price(self, symbol: str) -> Decimal:
@@ -121,14 +143,41 @@ class CexDataSource(MarketDataSource):
             raise QuoteUnavailable("balance sin campo 'total'")
         capital = Decimal(0)
         for asset, amount in totals.items():
-            qty = _to_decimal(amount, f"saldo de {asset}")
+            if asset in self._ignore_assets:
+                continue
+            qty = Decimal(0) if amount is None else _to_decimal(amount, f"saldo de {asset}")
             if qty == 0:
                 continue
             if asset in _STABLES:
                 capital += qty
-            else:
-                capital += qty * self._last_price(f"{asset}/{_QUOTE_ASSET}")
+                continue
+            price = self._asset_price(asset)
+            if price is not None:
+                capital += qty * price
         return capital
+
+
+    def _asset_price(self, asset: str) -> Decimal | None:
+        """Precio en USD del activo, o None si no tiene mercado.
+
+        Sin mercado (BadSymbol o símbolo ausente de client.markets) el activo es
+        tenencia ajena al bot y se omite con un WARNING. Cualquier otro fallo
+        sobre un par que sí existe sigue siendo QuoteUnavailable: omitirlo a
+        ratos descalibraría el pico de la protección de drawdown.
+        """
+        markets = getattr(self._client, "markets", None)
+        for quote in _QUOTE_ASSETS:
+            symbol = f"{asset}/{quote}"
+            if markets and symbol not in markets:
+                continue
+            try:
+                return self._last_price(symbol)
+            except _MarketMissing:
+                continue
+        if asset not in self._warned_assets:
+            self._warned_assets.add(asset)
+            logger.warning("activo %s sin mercado cotizable; se omite del capital", asset)
+        return None
 
 
 class CexCsvSignalSource(SignalSource):
