@@ -157,3 +157,79 @@ def test_list_followed_is_the_sorted_set_of_traders():
          Signal("b", "t1", Market.CEX, "X", Side.BUY, T0, None),
          Signal("c", "t2", Market.CEX, "X", Side.BUY, T0, None)]
     assert HistoricalSource(s, []).list_followed() == ["t1", "t2"]
+
+
+# --- el capital que ve el motor es el real, no una constante ---
+
+def protected_cfg(**protections):
+    raw = cfg().model_dump(mode="json")
+    raw["sizing"]["flat_amount_usd"] = 1000
+    raw["protections"] = protections
+    return BotConfig.model_validate(raw)
+
+
+def two_symbol_run(protections):
+    # BTC se hunde un 50 % (latente -500 sobre 10000); luego llega una señal de ETH
+    sigs = [sig_at(T0), sig_at(T0 + 2 * STEP, id_="s2", symbol="ETH/USDT")]
+    quotes = quotes_from(100, 100, 50, 50) + quotes_from(100, 100, 100, 100, symbol="ETH/USDT")
+    return run_backtest(protected_cfg(**protections), sigs, quotes, T0, END, STEP)
+
+
+def test_drawdown_protection_fires_in_backtest_because_balance_tracks_losses():
+    # con un capital plano esta protección no podía dispararse nunca en backtest
+    assert len(two_symbol_run({}).positions) == 2
+    assert [p.symbol for p in two_symbol_run({"max_drawdown_pct": 3}).positions] == ["BTC/USDT"]
+
+
+def test_balance_is_initial_plus_realized_and_unrealized_pnl():
+    from adapters.paper.executor import PaperExecutor
+    from core.models import Order
+    from storage.db import init_db
+    from storage.repository import Repository
+
+    src = HistoricalSource([], quotes_from(100, 100, 50), balance=Decimal("10000"))
+    src.set_time(T0)
+    conn = init_db(":memory:")
+    repo = Repository(conn)
+    src.bind_repository(repo)
+    assert src.get_balance() == Decimal("10000")
+    ex = PaperExecutor(src, 0, 10, 8)
+    fill = ex.submit_buy(Order("c1", Market.CEX, "BTC/USDT", Side.BUY, Decimal("1000"), Decimal("100")))
+    from core.models import Position
+    repo.save_position(Position("pos-c1", "s", "t1", Market.CEX, "BTC/USDT", fill.price, fill.quantity,
+                                Decimal("1000"), T0, fill.price))
+    repo.save_fill(fill)
+    # a 100: capital intacto menos la comisión de entrada (1 USD)
+    assert src.get_balance() == Decimal("10000") - Decimal("1")
+    src.set_time(T0 + 2 * STEP)  # BTC a 50: latente -500
+    assert src.get_balance() == Decimal("10000") - Decimal("1") - Decimal("500")
+    conn.close()
+
+
+# --- posiciones abiertas al final: no pueden esconderse ---
+
+def test_result_reports_positions_still_open_and_their_unrealized_pnl():
+    r = run_backtest(cfg(), [sig_at(T0)], falling_quotes(), T0, END, STEP)  # copy_sell: nunca cierra
+    assert r.open_positions_count == 1
+    (pos,) = r.positions
+    assert r.unrealized_pnl_usd == (Decimal("70") - pos.entry_price) * pos.quantity
+    assert r.unrealized_pnl_usd < 0
+    assert r.metrics.closes_by_reason == {}  # lo realizado parece sano; el resultado no lo oculta
+
+
+def test_result_without_open_positions_reports_zero():
+    r = run_backtest(cfg(stop_loss_pct=20), [sig_at(T0)], falling_quotes(), T0, END, STEP)
+    assert r.open_positions_count == 0 and r.unrealized_pnl_usd == Decimal("0")
+
+
+def test_report_shows_open_positions(tmp_path):
+    # una posición cerrada (para que haya informe) y una abierta
+    sigs = [sig_at(T0), sig_at(T0, id_="s2", symbol="ETH/USDT")]
+    quotes = falling_quotes() + quotes_from(100, 100, 100, 100, symbol="ETH/USDT")
+    raw = cfg(stop_loss_pct=20).model_dump(mode="json")
+    r = run_backtest(BotConfig.model_validate(raw), sigs, quotes, T0, END, STEP)
+    assert r.open_positions_count == 1
+    out = tmp_path / "r.html"
+    r.write_report(out)
+    text = out.read_text(encoding="utf-8")
+    assert "Posiciones abiertas al final: 1" in text

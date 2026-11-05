@@ -142,3 +142,29 @@ def test_html_report_is_written_by_quantstats(tmp_path):
 def test_html_report_without_closed_trades_fails_with_a_clear_message(tmp_path):
     with pytest.raises(ValueError, match="cerradas"):
         write_html_report([], [], tmp_path / "x.html")
+
+
+# --- heurística de quantstats: serie no negativa con máximo > 1 se toma por precios ---
+
+def test_expectancy_is_correct_when_every_trade_wins():
+    # quantstats.avg_return daba 0.75 aquí: trataba los USD como precios
+    fills, positions = pnls("10", "20", "30")
+    assert compute_metrics(fills, positions).expectancy_usd == Decimal("20")
+
+
+def test_expectancy_is_the_mean_over_all_closed_trades_breakeven_included():
+    fills, positions = pnls("10", "20", "0")
+    assert compute_metrics(fills, positions).expectancy_usd == Decimal("10")
+
+
+def test_large_non_negative_returns_are_not_mistaken_for_prices():
+    # capital inicial 10 y ganancias grandes: retornos diarios 0.5, 1.333, 0.857 (todos >= 0, uno > 1)
+    import numpy as np
+
+    fills, positions = build(*[trade(i, Decimal(p), day=i) for i, p in enumerate((5, 20, 30))])
+    m = compute_metrics(fills, positions, starting_equity=Decimal("10"))
+    r = np.array([5 / 10, 20 / 15, 30 / 35])
+    assert m.max_drawdown_usd == Decimal("0")
+    assert m.win_rate == Decimal("1.0000")
+    assert m.volatility == Decimal(repr(float(r.std(ddof=1) * np.sqrt(365)))).quantize(Decimal("0.0001"))
+    assert m.sharpe == Decimal(repr(float(r.mean() / r.std(ddof=1) * np.sqrt(365)))).quantize(Decimal("0.0001"))

@@ -18,8 +18,15 @@ Convenios:
   motor ``Position.id == "pos-" + client_order_id de la compra``.
 - Retorno de una operación = PnL / capital justo antes de cerrarla, con el
   capital inicial ``starting_equity`` (los retornos dependen de esa base).
-- Win rate y expectancy usan la convención de quantstats: las operaciones con
-  PnL exactamente cero no cuentan ni como ganadas ni como perdidas.
+- Win rate usa la convención de quantstats: las operaciones con PnL exactamente
+  cero no cuentan ni como ganadas ni como perdidas. La expectancy es la media del
+  PnL en USD sobre TODAS las operaciones cerradas (las de PnL cero la diluyen:
+  excluirlas la inflaría).
+- Heurística de quantstats: una serie no negativa con máximo > 1 se toma por
+  PRECIOS y se convierte en variaciones. Unos USD (o unos retornos > 100 %)
+  siempre la disparan, así que se evita: ``prepare_returns=False`` donde la API
+  lo admite; en Sharpe/Sortino (invariantes a la escala) se reescala la serie;
+  y sin ninguna operación perdedora el drawdown es 0 y no se consulta.
 - Sharpe, Sortino y volatilidad se calculan sobre retornos DIARIOS (UTC), con
   los días sin cierres a cero, anualizados con 365 periodos (los mercados
   cripto no cierran). Con menos de dos días valen cero: no hay desviación.
@@ -30,12 +37,17 @@ Convenios:
 from __future__ import annotations
 
 import math
+import re
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")  # informes sin ventana: el backend Tk falla (y no hace falta) en servidores
 
 import pandas as pd
 import quantstats as qs
@@ -119,6 +131,18 @@ def _per_trade(trades: list[_Trade], starting_equity: Decimal) -> tuple[pd.Serie
             pd.Series(equity_usd, index=index))
 
 
+def _scale_below_one(returns: pd.Series) -> pd.Series:
+    """Reescala una serie no negativa con máximo > 1 para que quantstats no la tome por precios.
+
+    Solo para métricas invariantes a la escala (Sharpe, Sortino): dividir todos
+    los retornos por una constante no las altera.
+    """
+    top = float(returns.max())
+    if returns.min() >= 0 and top > 1:
+        return returns / (2 * top)
+    return returns
+
+
 def _daily_returns(trades: list[_Trade], starting_equity: Decimal) -> pd.Series:
     by_day: dict = {}
     for t in trades:
@@ -147,30 +171,36 @@ def compute_metrics(
 
     # Drawdown: el porcentaje lo da quantstats; se pasa a USD con el pico de
     # capital vigente (el capital inicial cuenta como pico: perder primero es caída).
-    dd_pct = qs.stats.to_drawdown_series(returns)
-    peak_usd = equity_usd.cummax().clip(lower=float(starting_equity))
-    max_dd_usd = (-dd_pct * peak_usd).max()
+    # Sin retornos negativos no hay caída posible, y quantstats confundiría la serie
+    # con precios si algún retorno supera 1.
+    if (returns < 0).any():
+        dd_pct = qs.stats.to_drawdown_series(returns)
+        peak_usd = equity_usd.cummax().clip(lower=float(starting_equity))
+        max_dd_usd = float((-dd_pct * peak_usd).max())
+    else:
+        max_dd_usd = 0.0
 
     daily = _daily_returns(trades, starting_equity)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # quantstats avisa de series cortas; ya se acotan abajo
         if len(daily) >= 2:
-            sharpe = qs.stats.sharpe(daily, periods=PERIODS_PER_YEAR)
-            sortino = qs.stats.sortino(daily, periods=PERIODS_PER_YEAR)
-            volatility = qs.stats.volatility(daily, periods=PERIODS_PER_YEAR)
+            scaled = _scale_below_one(daily)  # Sharpe y Sortino no cambian con la escala
+            sharpe = qs.stats.sharpe(scaled, periods=PERIODS_PER_YEAR)
+            sortino = qs.stats.sortino(scaled, periods=PERIODS_PER_YEAR)
+            volatility = qs.stats.volatility(daily, periods=PERIODS_PER_YEAR, prepare_returns=False)
         else:
             sharpe = sortino = volatility = 0.0
-        win_rate = qs.stats.win_rate(returns)
-        expectancy = qs.stats.avg_return(pnl_usd)  # media del PnL en USD por operación
+        win_rate = qs.stats.win_rate(returns, prepare_returns=False)
+    expectancy = sum((t.pnl for t in trades), _ZERO) / len(trades)
 
     durations = [(t.closed_at - t.position.opened_at).total_seconds() / 3600 for t in trades]
     reasons = Counter(t.position.exit_reason for t in trades if t.position.exit_reason)
 
     return Metrics(
         total_pnl_usd=sum((t.pnl for t in trades), _ZERO).quantize(_Q4),
-        max_drawdown_usd=_dec(max_dd_usd),
+        max_drawdown_usd=_dec(max_dd_usd) + _ZERO,
         win_rate=_dec(win_rate),
-        expectancy_usd=_dec(expectancy),
+        expectancy_usd=expectancy.quantize(_Q4),
         sharpe=_dec(sharpe),
         avg_duration_hours=_dec(sum(durations) / len(durations)),
         closes_by_reason=dict(reasons),
@@ -182,6 +212,7 @@ def compute_metrics(
 def write_html_report(
     fills: list[Fill], positions: list[Position], path: Path,
     starting_equity: Decimal = DEFAULT_STARTING_EQUITY, title: str = "Backtest",
+    banner_html: str | None = None,
 ) -> None:
     """Informe HTML de quantstats sobre los retornos diarios (``backtest --report``)."""
     trades = _closed_trades(fills, positions)
@@ -191,3 +222,10 @@ def write_html_report(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         qs.reports.html(daily, benchmark=None, output=str(path), title=title, periods_per_year=PERIODS_PER_YEAR)
+    if banner_html:
+        # quantstats no tiene hueco para avisos propios: se inserta tras <body>.
+        text = Path(path).read_text(encoding="utf-8")
+        text, n = re.subn(r"(<body[^>]*>)", lambda m: m.group(1) + banner_html, text, count=1, flags=re.I)
+        if n != 1:
+            raise RuntimeError("el informe de quantstats no tiene <body>: no se pudo añadir el aviso")
+        Path(path).write_text(text, encoding="utf-8")
