@@ -184,6 +184,16 @@ def test_example_config_loads_with_conservative_defaults():
     assert c.risk.max_usd_per_day == Decimal("150")
     assert c.exits.primary == "copy_sell" and c.exits.time_stop_hours == 72
     assert c.cadence.entry_cron == "0 * * * *" and c.cadence.exit_interval_seconds == 60
+    pr = c.protections
+    assert (pr.cooldown_minutes, pr.stop_loss_streak) == (60, 3)
+    assert (pr.streak_window_hours, pr.streak_pause_hours) == (24, 12)
+    assert pr.max_drawdown_pct == Decimal("10") and pr.max_usd_per_group == Decimal("100")
+    assert c.groups["solana_memes"] == ["BONK", "WIF"]
+
+
+def test_example_config_loads_without_error():
+    # Incluye las reglas cruzadas: max_usd_per_group (100) > max_usd_per_token (50) es intencionado.
+    assert load_config(Path("config/config.example.yaml")) is not None
 
 
 def test_env_example_has_no_secret_values():
