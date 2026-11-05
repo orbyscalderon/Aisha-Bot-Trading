@@ -93,9 +93,13 @@ END;
 """
 
 
-def init_db(path: Path) -> sqlite3.Connection:
-    """Abre (o crea) la base de datos y asegura el esquema. Idempotente."""
-    conn = sqlite3.connect(str(path))
+def init_db(path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Abre (o crea) la base de datos y asegura el esquema. Idempotente.
+
+    ``check_same_thread=False`` es para el planificador de la CLI, que ejecuta los
+    ciclos en hilos de trabajo; quien lo use debe serializar el acceso (la CLI lo hace).
+    """
+    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

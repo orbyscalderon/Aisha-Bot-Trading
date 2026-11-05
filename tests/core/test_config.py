@@ -286,3 +286,31 @@ def test_trailing_with_trailing_pct_loads(yaml_with):
     raw["exits"].update({"primary": "take_profit", "take_profit_pct": 30,
                          "trailing": True, "trailing_pct": 10})
     assert load_config(yaml_with(raw=raw)).exits.trailing_pct == Decimal("10")
+
+
+# --- protecciones: en live deben escribirse (un olvido no puede ser un "sin protecciones") ---
+
+def _live_data():
+    data = copy.deepcopy(BASE)
+    data["mode"] = "live"
+    data["exits"]["stop_loss_pct"] = 15
+    return data
+
+
+def test_live_requires_protections_section_to_be_written(yaml_with):
+    data = _live_data()
+    data.pop("protections", None)
+    with pytest.raises(ConfigError, match="protections"):
+        load_config(yaml_with(raw=data))
+
+
+def test_live_accepts_explicitly_empty_protections(yaml_with):
+    data = _live_data()
+    data["protections"] = {"cooldown_minutes": 0}
+    assert load_config(yaml_with(raw=data)).mode.value == "live"
+
+
+def test_paper_does_not_require_protections_section(yaml_with):
+    data = copy.deepcopy(BASE)
+    data.pop("protections", None)
+    assert load_config(yaml_with(raw=data)).mode.value == "paper"

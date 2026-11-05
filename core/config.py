@@ -163,6 +163,13 @@ class BotConfig(_Strict):
                 seen[symbol] = name
         if self.mode is Mode.LIVE and self.exits.stop_loss_pct is None:
             raise ValueError("exits.stop_loss_pct es obligatorio en modo live")
+        # Las protecciones valen 0 por defecto y 0 las desactiva: una sección ausente correría
+        # sin ninguna y sin señal. En real, correr sin protecciones debe ser una decisión escrita.
+        if self.mode is Mode.LIVE and "protections" not in self.model_fields_set:
+            raise ValueError(
+                "protections es obligatorio en modo live: escribe la sección (con 0 se "
+                "desactiva cada protección) para que correr sin ellas sea una decisión y no un olvido"
+            )
         if self.sizing.strategy == "risk" and self.exits.stop_loss_pct is None:
             raise ValueError("exits.stop_loss_pct es obligatorio con sizing.strategy=risk: sin stop no hay distancia que medir")
         return self
