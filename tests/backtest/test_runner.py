@@ -233,3 +233,23 @@ def test_report_shows_open_positions(tmp_path):
     r.write_report(out)
     text = out.read_text(encoding="utf-8")
     assert "Posiciones abiertas al final: 1" in text
+
+
+def test_balance_raises_when_an_open_position_has_no_quote():
+    # decisión, no accidente: igual que el adaptador real, un hueco en los datos
+    # no se valora en silencio (el motor registra el error del ciclo y sigue).
+    from core.models import Position
+    from storage.db import init_db
+    from storage.repository import Repository
+
+    src = HistoricalSource([], quotes_from(100))
+    src.set_time(T0)
+    conn = init_db(":memory:")
+    repo = Repository(conn)
+    src.bind_repository(repo)
+    repo.save_position(Position("p1", "s", "t1", Market.CEX, "ETH/USDT", Decimal("1"), Decimal("1"),
+                                Decimal("1"), T0, Decimal("1")))
+    with pytest.raises(QuoteUnavailable):
+        src.get_balance()
+    conn.close()
+

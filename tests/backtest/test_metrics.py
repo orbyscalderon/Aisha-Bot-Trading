@@ -168,3 +168,39 @@ def test_large_non_negative_returns_are_not_mistaken_for_prices():
     assert m.win_rate == Decimal("1.0000")
     assert m.volatility == Decimal(repr(float(r.std(ddof=1) * np.sqrt(365)))).quantize(Decimal("0.0001"))
     assert m.sharpe == Decimal(repr(float(r.mean() / r.std(ddof=1) * np.sqrt(365)))).quantize(Decimal("0.0001"))
+
+
+def _report_text(path):
+    import re
+
+    html = re.sub(r"<svg.*?</svg>", "", path.read_text(encoding="utf-8"), flags=re.S)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+
+
+def test_html_report_shows_real_values_when_every_daily_return_is_non_negative(tmp_path):
+    # retornos diarios 0.5, 1.333, 0.857: quantstats los tomaría por precios (71.43 %)
+    fills, positions = build(*[trade(i, Decimal(p), day=i) for i, p in enumerate((5, 20, 30))])
+    out = tmp_path / "r.html"
+    write_html_report(fills, positions, out, starting_equity=Decimal("10"))
+    # capital 10 -> 65: 1.5 x 2.3333 x 1.8571 - 1 = 550 %
+    assert "Cumulative Return 550.0" in _report_text(out)
+
+
+def test_html_report_leaves_quantstats_untouched_afterwards(tmp_path):
+    import quantstats.reports as reports
+
+    before = reports._get_utils
+    fills, positions = build(*[trade(i, Decimal(p), day=i) for i, p in enumerate((5, 20, 30))])
+    write_html_report(fills, positions, tmp_path / "r.html", starting_equity=Decimal("10"))
+    assert reports._get_utils is before
+
+
+def test_importing_metrics_does_not_change_the_matplotlib_backend():
+    import subprocess
+    import sys
+
+    code = ("import matplotlib; b = matplotlib.get_backend(); import backtest.metrics; "
+            "assert matplotlib.get_backend() == b, (b, matplotlib.get_backend())")
+    from pathlib import Path
+
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=Path(__file__).resolve().parents[2])

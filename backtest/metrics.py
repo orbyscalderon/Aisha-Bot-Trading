@@ -45,12 +45,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import contextlib
+
 import matplotlib
-
-matplotlib.use("Agg")  # informes sin ventana: el backend Tk falla (y no hace falta) en servidores
-
 import pandas as pd
 import quantstats as qs
+import quantstats.reports as qs_reports
 
 from core.models import ExitReason, Fill, Position, Side
 
@@ -209,6 +209,51 @@ def compute_metrics(
     )
 
 
+@contextlib.contextmanager
+def _agg_backend():
+    """Backend sin ventana solo mientras se escribe el informe (el Tk puede fallar y no hace
+    falta); se restaura después para no cambiar el proceso del que importa este módulo."""
+    previous = matplotlib.get_backend()
+    matplotlib.use("Agg")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            matplotlib.use(previous)
+
+
+@contextlib.contextmanager
+def _no_price_heuristic(returns: pd.Series):
+    """Evita que ``qs.reports.html`` reinterprete ``returns`` como precios.
+
+    ``reports.html`` llama a ``utils._prepare_returns`` sobre la serie; con una
+    serie no negativa de máximo > 1 aplica variación porcentual. Aquí NO vale
+    reescalar (el informe muestra porcentajes absolutos), así que durante la
+    llamada ``reports._get_utils`` devuelve un envoltorio cuyo ``_prepare_returns``
+    deja pasar la serie tal cual, que ya está limpia (finita, sin zona horaria, rf=0).
+    Solo se activa cuando la heurística se dispararía, y se deshace siempre. Depende
+    de un detalle interno de quantstats 0.0.86: si cambia, falla alto (AttributeError).
+    """
+    if not (returns.min() >= 0 and returns.max() > 1):
+        yield
+        return
+    original = qs_reports._get_utils
+
+    class _Utils:
+        def __getattr__(self, name):
+            return getattr(original(), name)
+
+        @staticmethod
+        def _prepare_returns(data, *args, **kwargs):
+            return data
+
+    qs_reports._get_utils = lambda: _Utils()
+    try:
+        yield
+    finally:
+        qs_reports._get_utils = original
+
+
 def write_html_report(
     fills: list[Fill], positions: list[Position], path: Path,
     starting_equity: Decimal = DEFAULT_STARTING_EQUITY, title: str = "Backtest",
@@ -219,7 +264,7 @@ def write_html_report(
     if not trades:
         raise ValueError("no hay operaciones cerradas: no hay nada que informar")
     daily = _daily_returns(trades, starting_equity)
-    with warnings.catch_warnings():
+    with warnings.catch_warnings(), _agg_backend(), _no_price_heuristic(daily):
         warnings.simplefilter("ignore")
         qs.reports.html(daily, benchmark=None, output=str(path), title=title, periods_per_year=PERIODS_PER_YEAR)
     if banner_html:
