@@ -1098,9 +1098,11 @@ def test_uses_real_quote_from_data_source():
     assert PaperExecutor(src(42), 0, 0, 8).submit_buy(order(Decimal("42"))).price == Decimal("42")
 
 def test_raises_when_quantity_rounds_to_zero():
-    # el ejecutor es la autoridad sobre la cantidad: si el precio deslizado la anula, falla
+    # El ejecutor es la autoridad sobre la cantidad: si el redondeo la anula, falla.
+    # Cuidado con la aritmética: 50/120000 = 0.000416 -> 0.0004 con 4 decimales, NO es cero.
+    # Con 5 USD: 5/120000 = 0.0000416 -> 0.0000.
     with pytest.raises(ZeroQuantity):
-        PaperExecutor(src(120000), 0, 0, quantity_precision=4).submit_buy(order(Decimal("50")))
+        PaperExecutor(src(120000), 0, 0, quantity_precision=4).submit_buy(order(Decimal("5")))
 
 def test_quantity_respects_configured_precision():
     f = PaperExecutor(src(3), 0, 0, quantity_precision=2).submit_buy(order(Decimal("10")))
@@ -1270,6 +1272,8 @@ Run: `pytest tests/adapters/cex/test_source.py -v`
 Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `CexDataSource` y `CexCsvSignalSource`**
+
+**`get_balance()` devuelve el capital TOTAL de la cuenta, incluido el valor de las posiciones abiertas**, no el efectivo libre. En `ccxt` eso es el `total` del balance, no el `free`. El contrato no es cosmético: la protección de drawdown compara el capital actual contra un pico persistido, así que si esta función devolviera efectivo libre, abrir posiciones lo bajaría por debajo del pico y la protección bloquearía todas las entradas de forma permanente.
 
 `CexDataSource` envuelve `ccxt`, llamando a `fetch_ticker`. El cliente de `ccxt` se inyecta por un constructor alternativo `from_client` para que los tests no toquen la red. Los precios se convierten con `Decimal(str(valor))`, nunca `Decimal(float)`. Cualquier error de `ccxt` o precio no positivo se envuelve en `QuoteUnavailable` (definida en `ports/market.py`, Tarea 10), de forma que el motor lo trate con el camino de `INVALID_QUOTE` ya probado en la Tarea 12.
 

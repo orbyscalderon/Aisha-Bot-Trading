@@ -140,7 +140,7 @@ Deliberadamente son **dos puertos distintos**:
 ```python
 class MarketDataSource(ABC):
     def get_quote(self, symbol: str) -> Quote: ...
-    def get_balance(self) -> Decimal: ...
+    def get_balance(self) -> Decimal: ...   # capital TOTAL, con las posiciones abiertas
 
 class OrderExecutor(ABC):
     def submit_buy(self, order: Order) -> Fill: ...
@@ -340,9 +340,26 @@ reiniciar el proceso.
 Reintentar puede comprar dos veces. No reintentar puede dejar una posición abierta sin registro.
 Ambos escenarios son pérdidas reales.
 
-**La solución.** Cada orden lleva un `client_order_id` determinista, derivado por hash de
-`(signal_id, trader_id, symbol, side, cycle_timestamp)`. La misma señal procesada dos veces
-produce el mismo identificador.
+**La solución.** Cada orden lleva un `client_order_id` determinista, derivado por hash de:
+
+- **Entradas:** `(signal_id, trader_id, symbol, side)`.
+- **Salidas:** `(position_id, side, exit_reason)`.
+
+**Ninguno de los dos incluye la hora del ciclo, y esa ausencia es el punto entero.** Una
+versión anterior de este spec incluía `cycle_timestamp` en el hash, lo que anulaba la garantía
+sin que se notara: un ciclo abre una posición, el proceso cae antes de que avance el cursor, y
+al reiniciar la misma señal llega con otro reloj, produce otro identificador, la reserva tiene
+éxito y **se compra dos veces**. Es exactamente el fallo que esta sección existe para impedir.
+
+La unicidad la aporta `signal_id`, que las fuentes derivan de forma estable del contenido de la
+señal. Si el mismo trader repite la misma operación más tarde, es otra señal con otro
+`signal_id`, así que no colisionan.
+
+**Una salida fallida debe poder reintentarse.** Un intent en estado `FAILED` puede volver a
+reservarse (`FAILED → RESERVED`), porque `FAILED` significa que sabemos que la orden **no** se
+ejecutó. Sin esta transición, un stop-loss que falla una vez quedaría bloqueado como duplicado
+para siempre y la posición no podría cerrarse nunca, que es el peor desenlace posible de un
+esquema de identificadores. Los estados `RESERVED`, `SENT` y `CONFIRMED` siguen bloqueando.
 
 El flujo, en este orden exacto:
 
