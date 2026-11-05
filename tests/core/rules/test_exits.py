@@ -136,3 +136,29 @@ def test_no_exit_when_nothing_triggers():
 def test_next_peak_price_only_rises():
     assert next_peak_price(pos(peak=200), q(150)) == Decimal("200")
     assert next_peak_price(pos(peak=200), q(250)) == Decimal("250")
+
+
+def test_trailing_arms_on_peak_even_when_price_fell_below_threshold():
+    # pico 200 -> armado. El precio 120 (+20%) NO alcanza el tp de 30%,
+    # así que si el armado leyera el precio actual en vez del pico, no cerraría.
+    # Retroceso desde el pico: (200-120)/200 = 40% > trailing_pct 10 -> cierra.
+    d = evaluate_exit(pos(entry=100, peak=200), q(120), T1,
+                      cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None)
+    assert d.reason is ExitReason.TAKE_PROFIT
+
+
+def test_trailing_does_not_fire_exactly_at_the_retrace_threshold():
+    # pico 200, trailing_pct 10 -> 180 es exactamente -10%: no dispara
+    assert evaluate_exit(pos(entry=100, peak=200), q(180), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
+
+
+def test_trailing_does_not_arm_exactly_at_the_arming_threshold():
+    # pico 130 es exactamente +30%: no arma, así que no cierra
+    assert evaluate_exit(pos(entry=100, peak=130), q(100), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
+
+
+def test_copy_sell_fraction_above_one_is_clamped_to_one():
+    d = evaluate_exit(pos(entry=100), q(105), T1, cfg(primary="copy_sell"), Decimal("1.5"))
+    assert d.reason is ExitReason.COPY_SELL and d.fraction == Decimal("1")
