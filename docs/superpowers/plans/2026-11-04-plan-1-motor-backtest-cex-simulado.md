@@ -100,7 +100,7 @@ git commit -m "feat(core): añadir modelos del dominio"
 
 **Interfaces:**
 - Consumes: enums de Tarea 1.
-- Produces: `load_config(yaml_path: Path) -> BotConfig`. `BotConfig` con atributos `mode`, `sizing: SizingConfig`, `exits: ExitsConfig`, `risk: RiskConfig`, `cadence: CadenceConfig`, `allowlist: list[str]`, `markets: dict`. `BotConfig.fingerprint() -> str` (sha256 del contenido normalizado, para el periodo de sombra del plan 3). Excepción `ConfigError`.
+- Produces: `load_config(yaml_path: Path) -> BotConfig`. `BotConfig` con atributos `mode`, `sizing: SizingConfig`, `exits: ExitsConfig`, `risk: RiskConfig`, `cadence: CadenceConfig`, `execution: dict[Market, ExecutionConfig]`, `allowlist: list[str]`. `ExecutionConfig` con `slippage_bps: int`, `fee_bps: int`, `quantity_precision: int`. `BotConfig.fingerprint() -> str` (sha256 del contenido normalizado, para el periodo de sombra del plan 3). Excepción `ConfigError`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -130,6 +130,22 @@ def test_fingerprint_stable_across_key_order():
 
 def test_fingerprint_changes_with_threshold():
     assert load_config(a).fingerprint() != load_config(a_with_other_stop_loss).fingerprint()
+
+def test_execution_defaults_per_market():
+    # spec §6.2: el deslizamiento por defecto es mayor en Solana que en CEX
+    ex = load_config(minimal_yaml).execution
+    assert ex[Market.CEX].slippage_bps == 10 and ex[Market.CEX].fee_bps == 10
+    assert ex[Market.SOLANA].slippage_bps == 100 and ex[Market.SOLANA].fee_bps == 25
+    assert ex[Market.STOCKS].slippage_bps == 5 and ex[Market.STOCKS].fee_bps == 0
+    assert ex[Market.FOMO].slippage_bps == 100 and ex[Market.FOMO].fee_bps == 25
+
+def test_quantity_precision_defaults_per_market():
+    ex = load_config(minimal_yaml).execution
+    assert (ex[Market.CEX].quantity_precision, ex[Market.SOLANA].quantity_precision) == (8, 6)
+    assert (ex[Market.STOCKS].quantity_precision, ex[Market.FOMO].quantity_precision) == (4, 6)
+
+def test_execution_values_overridable_from_yaml():
+    assert load_config(yaml_with_cex_slippage(42)).execution[Market.CEX].slippage_bps == 42
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -140,6 +156,8 @@ Expected: FAIL con `ModuleNotFoundError`
 - [ ] **Step 3: Implement `load_config` en `core/config.py` con modelos `pydantic` v2**
 
 Un validador de modelo en `BotConfig` aplica las reglas cruzadas: `stop_loss_pct` obligatorio si `mode == LIVE`; `mirror_pct` y `mirror_cap_usd` obligatorios si `sizing.strategy == "mirror"`; `exits.primary` obligatorio y uno de `copy_sell|take_profit|time_stop`; `take_profit_pct` obligatorio si `primary == "take_profit"`; `time_stop_hours` obligatorio si `primary == "time_stop"`; todos los límites de `risk` positivos. Los errores de `pydantic` se envuelven en `ConfigError` conservando el mensaje. `fingerprint()` serializa con `json.dumps(..., sort_keys=True, default=str)` y devuelve el sha256 hexadecimal.
+
+`execution` se rellena por mercado con los valores por defecto de los tests cuando el YAML no los da, y el YAML puede sobrescribir cualquiera. Los valores viven en configuración y no en el código porque el spec §6.2 exige que el deslizamiento sea ajustable y más alto donde hay menos liquidez.
 
 `config/config.example.yaml` lleva los valores por defecto del spec §4.3 y §4.5. `config/.env.example` documenta las claves del spec §7.5, con el comentario de que las de exchange deben crearse **sin permiso de retirada**.
 
@@ -195,6 +213,18 @@ def test_freeze_allowlist_is_write_once_per_session():
     repo.freeze_allowlist("s1", {"t1"})
     with pytest.raises(ValueError):
         repo.freeze_allowlist("s1", {"t1", "t2"})
+
+def test_order_intents_rejects_duplicate_primary_key():
+    conn.execute("INSERT INTO order_intents VALUES ('ct-a','RESERVED','{}','2026-11-04',NULL)")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO order_intents VALUES ('ct-a','RESERVED','{}','2026-11-04',NULL)")
+
+def test_audit_log_rejects_update_and_delete():
+    conn.execute("INSERT INTO audit_log (timestamp,event,payload) VALUES ('t','e','{}')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE audit_log SET event='x'")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM audit_log")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -204,7 +234,13 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement el esquema y el repositorio**
 
-Tablas: `positions`, `fills`, `cursors`, `frozen_allowlist`, y `order_intents` y `audit_log` (sus columnas las definen las Tareas 8 y 9; créalas aquí para tener un único punto de esquema). `PRAGMA journal_mode=WAL` y `foreign_keys=ON`.
+**Esta tarea es dueña del esquema completo. Ninguna tarea posterior ejecuta DDL.** Seis tablas:
+
+- `positions`, `fills`, `cursors`, `frozen_allowlist`
+- `order_intents`: `client_order_id TEXT PRIMARY KEY`, `status TEXT`, `payload TEXT`, `created_at TEXT`, `error TEXT NULL`. La PRIMARY KEY no es decorativa: la Tarea 8 se apoya en ella para la idempotencia.
+- `audit_log`: `id INTEGER PRIMARY KEY AUTOINCREMENT`, `timestamp TEXT`, `event TEXT`, `payload TEXT`, más dos triggers `BEFORE UPDATE` y `BEFORE DELETE` que llaman a `RAISE(ABORT, ...)`.
+
+`PRAGMA journal_mode=WAL` y `foreign_keys=ON`.
 
 Los `Decimal` se guardan como `TEXT` y se reconstruyen con `Decimal(str)`; registra adaptadores con `sqlite3.register_adapter`/`register_converter`. Guardarlos como `REAL` perdería precisión, que es justo lo que el spec §2 prohíbe. Las marcas temporales se guardan en ISO-8601 UTC y se devuelven siempre con `tzinfo=timezone.utc`.
 
@@ -306,7 +342,7 @@ def test_stop_loss_triggers_below_threshold():
     assert d.reason is ExitReason.STOP_LOSS and d.fraction == Decimal("1")
 
 def test_stop_loss_not_triggered_exactly_at_threshold():
-    # 80 es exactamente -20%: el umbral se cruza, no se toca
+    # 80 es exactamente -20%: con desigualdad estricta, no dispara
     assert evaluate_exit(pos(entry=100), q(80), T1, cfg(stop_loss_pct=20), None) is None
 
 def test_copy_sell_partial_mirrors_fraction():
@@ -391,7 +427,7 @@ git commit -m "feat(core): añadir reglas de salida con precedencia fija"
 
 **Interfaces:**
 - Consumes: `RejectReason` (Tarea 1), `RiskConfig` (Tarea 2).
-- Produces: `RiskState` congelada con `utc_day: date`, `spent_usd_today: Decimal`, `realized_pnl_usd_today: Decimal`, `open_position_count: int`, `exposure_by_symbol: Mapping[str, Decimal]`. `evaluate_risk(amount_usd, symbol, state, cfg) -> RiskVerdict`. `RiskVerdict` congelada con `action: RiskAction` (`ALLOW`, `REJECT`, `SHUTDOWN`) y `reason: RejectReason | None`. `build_risk_state(repo, utc_day) -> RiskState`.
+- Produces: `RiskState` congelada con `utc_day: date`, `spent_usd_today: Decimal`, `realized_pnl_usd_today: Decimal`, `open_position_count: int`, `exposure_by_symbol: Mapping[str, Decimal]`. `evaluate_risk(amount_usd, symbol, state, cfg) -> RiskVerdict`. `RiskVerdict` congelada con `action: RiskAction` (`ALLOW`, `REJECT`, `SHUTDOWN`) y `reason: RejectReason | None`. `build_risk_state(repo, utc_day, exposure_by_symbol, open_position_count) -> RiskState`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -432,7 +468,12 @@ def test_build_risk_state_uses_fixed_utc_day_not_now():
     # Review Focus 2: el día se fija al inicio del ciclo, no se vuelve a leer
     repo.save_fill(fill_at(datetime(2026, 11, 4, 23, 59, tzinfo=utc), Decimal("100")))
     repo.save_fill(fill_at(datetime(2026, 11, 5, 0, 1, tzinfo=utc), Decimal("700")))
-    assert build_risk_state(repo, date(2026, 11, 4)).spent_usd_today == Decimal("100")
+    assert build_risk_state(repo, date(2026, 11, 4), {}, 0).spent_usd_today == Decimal("100")
+
+def test_build_risk_state_takes_exposure_from_caller():
+    # la exposición la agrega Portfolio (Tarea 11), no esta función: una sola agregación
+    s = build_risk_state(repo, D, {"BTC/USDT": Decimal("80")}, 3)
+    assert s.exposure_by_symbol == {"BTC/USDT": Decimal("80")} and s.open_position_count == 3
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -666,7 +707,7 @@ git commit -m "feat(storage): añadir log de auditoría inmutable"
 
 **Interfaces:**
 - Consumes: modelos de Tarea 1.
-- Produces: ABC `MarketDataSource` (`get_quote(symbol) -> Quote`, `get_balance() -> Decimal`), ABC `OrderExecutor` (`submit_buy(order) -> Fill`, `submit_sell(order) -> Fill`), ABC `SignalSource` (`fetch_trades(since) -> list[Signal]`, `list_followed() -> list[str]`, `name: str`), ABC `Notifier` (`send(message, level) -> None`). Excepción `QuoteUnavailable` en `ports/market.py` y enum `Level` (`INFO`, `WARNING`, `CRITICAL`) en `ports/notifier.py`. En `core/safety.py`: `mode_prefix(mode) -> str`, `is_kill_switch_active(root: Path) -> bool`, `CircuitBreaker(threshold=3)` con `record_failure()`, `record_success()`, `is_open`.
+- Produces: ABC `MarketDataSource` (`get_quote(symbol) -> Quote`, `get_balance() -> Decimal`), ABC `OrderExecutor` (`submit_buy(order) -> Fill`, `submit_sell(order) -> Fill`), ABC `SignalSource` (`fetch_trades(since) -> list[Signal]`, `list_followed() -> list[str]`, `name: str`), ABC `Notifier` (`send(message, level) -> None`). Excepciones `QuoteUnavailable` y `ZeroQuantity` en `ports/market.py`, y enum `Level` (`INFO`, `WARNING`, `CRITICAL`) en `ports/notifier.py`. En `core/safety.py`: `mode_prefix(mode) -> str`, `is_kill_switch_active(root: Path) -> bool`, `CircuitBreaker(threshold=3)` con `record_failure()`, `record_success()`, `is_open`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -878,7 +919,11 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `Engine` en `core/engine.py`**
 
-`run_entry_cycle`, en este orden: comprobar kill switch; fijar `utc_day = now.date()` **una sola vez**; congelar allowlist; leer el cursor y pedir señales; filtrar por allowlist; para cada señal, calcular `client_order_id` y reservar el intent (si devuelve `False`, omitir como duplicado); obtener cotización y validarla (`> 0`, no `None`); evaluar riesgo (si `SHUTDOWN`, terminar el ciclo); calcular tamaño y aplicar el techo duro; convertir a cantidad y rechazar si redondea a cero; enviar al ejecutor; registrar posición y fill; auditar cada paso. El cursor avanza con `clamp_cursor` solo al final, si no hubo excepción.
+`run_entry_cycle`, en este orden: comprobar kill switch; fijar `utc_day = now.date()` **una sola vez**; congelar allowlist con `ensure_frozen_allowlist`; leer el cursor y pedir señales; filtrar por allowlist; para cada señal, obtener cotización y validarla (`> 0`, no `None`); construir el estado de riesgo con la exposición y el recuento que da `Portfolio`, y evaluarlo (si `SHUTDOWN`, terminar el ciclo); calcular tamaño y aplicar el techo duro; aplicar el **guardia de cantidad cero**; calcular `client_order_id` y reservar el intent (si devuelve `False`, omitir como duplicado); enviar al ejecutor; registrar posición y fill; auditar cada paso. El cursor avanza con `clamp_cursor` solo al final, si no hubo excepción.
+
+**El guardia de cantidad cero no calcula la cantidad definitiva.** Divide el importe entre el precio cotizado, redondea con el `quantity_precision` del mercado y rechaza con `ZERO_QUANTITY` si da cero. La cantidad autoritativa la produce el ejecutor desde el precio ya deslizado, y `Position.quantity` sale siempre del `Fill`, nunca de este guardia. El guardia existe para rechazar **antes** de consumir un `client_order_id`; si aun así el ejecutor lanza `ZeroQuantity`, el motor lo trata como orden fallida y marca el intent como fallido.
+
+La reserva del intent va **después** de los rechazos, no antes: un `client_order_id` reservado es irrepetible, y gastarlo en una señal que el riesgo iba a rechazar impediría reintentarla cuando las condiciones cambien.
 
 `run_exit_cycle`: para cada posición abierta, obtener cotización (si falla, acumular en `errors` y continuar con la siguiente), actualizar `peak_price` con `next_peak_price`, evaluar salida y cerrar si procede. No comprueba el kill switch.
 
@@ -906,7 +951,7 @@ git commit -m "feat(core): añadir motor de decisión de entrada y salida"
 
 **Interfaces:**
 - Consumes: `OrderExecutor` (Tarea 10), `MarketDataSource` (Tarea 10), `Order`, `Fill` (Tarea 1).
-- Produces: `PaperExecutor(data_source, slippage_bps: int, fee_bps: int)` implementando `OrderExecutor`.
+- Produces: `PaperExecutor(data_source, slippage_bps: int, fee_bps: int, quantity_precision: int)` implementando `OrderExecutor`. Los tres enteros salen de `config.execution[market]` (Tarea 2); el ejecutor no los fija por su cuenta.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -933,7 +978,16 @@ def test_fill_carries_client_order_id():
 
 def test_uses_real_quote_from_data_source():
     # spec §3.3: el dinero es falso, los precios no
-    assert PaperExecutor(src(42), 0, 0).submit_buy(order(Decimal("42"))).price == Decimal("42")
+    assert PaperExecutor(src(42), 0, 0, 8).submit_buy(order(Decimal("42"))).price == Decimal("42")
+
+def test_raises_when_quantity_rounds_to_zero():
+    # el ejecutor es la autoridad sobre la cantidad: si el precio deslizado la anula, falla
+    with pytest.raises(ZeroQuantity):
+        PaperExecutor(src(120000), 0, 0, quantity_precision=4).submit_buy(order(Decimal("50")))
+
+def test_quantity_respects_configured_precision():
+    f = PaperExecutor(src(3), 0, 0, quantity_precision=2).submit_buy(order(Decimal("10")))
+    assert f.quantity == Decimal("3.33")  # ROUND_DOWN, nunca compra de más
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -944,6 +998,8 @@ Expected: FAIL con `ModuleNotFoundError`
 - [ ] **Step 3: Implement `PaperExecutor`**
 
 Pide la cotización real al `MarketDataSource` que recibe por constructor, aplica el deslizamiento en la dirección que perjudica al operador (sumando en compras, restando en ventas), calcula la comisión sobre el nocional y devuelve un `Fill`.
+
+La cantidad se redondea con `ROUND_DOWN` a `quantity_precision` decimales, y si da cero se lanza `ZeroQuantity` en lugar de devolver un `Fill` vacío. Este ejecutor es la autoridad sobre la cantidad: el guardia del motor (Tarea 12) solo rechaza antes de reservar el intent, y la cantidad que se persiste en la posición sale siempre de este `Fill`.
 
 El deslizamiento va siempre en contra a propósito: un simulador optimista convierte estrategias perdedoras en ganadoras sobre el papel, que es exactamente lo que el spec §6.2 quiere evitar.
 
