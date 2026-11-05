@@ -288,11 +288,13 @@ git commit -m "feat(storage): añadir esquema SQLite y repositorio"
 
 **Files:**
 - Create: `core/rules/sizing.py`
-- Test: `tests/core/rules/test_sizing.py`
+- Modify: `core/config.py` (añadir la estrategia `risk` y su regla cruzada)
+- Test: `tests/core/rules/test_sizing.py`, `tests/core/test_config.py`
 
 **Interfaces:**
 - Consumes: `Signal` (Tarea 1), `SizingConfig` (Tarea 2).
-- Produces: `calculate_size(signal: Signal, cfg: SizingConfig) -> SizeResult`. `SizeResult` congelada con `amount_usd: Decimal` y `used_fallback: bool`. `apply_hard_cap(amount_usd: Decimal, hard_max_usd: Decimal) -> Decimal`.
+- Produces: `calculate_size(signal: Signal, cfg: SizingConfig, ctx: SizingContext) -> SizeResult`. `SizingContext` congelada con `equity_usd: Decimal`, `stop_loss_pct: Decimal | None`, `slippage_bps: int`, `fee_bps: int`. `SizeResult` congelada con `amount_usd: Decimal` y `used_fallback: bool`. `apply_hard_cap(amount_usd: Decimal, hard_max_usd: Decimal) -> Decimal`.
+- **Esta tarea añade también la tercera estrategia de tamaño a `core/config.py`**: `SizingConfig.strategy` acepta `risk`, con el campo `risk_pct: Decimal | None`. Regla cruzada nueva: `strategy == "risk"` exige `risk_pct` en (0, 100] **y** exige que `exits.stop_loss_pct` esté configurado. La Tarea 2 está cerrada; esta estrategia entra entera aquí, configuración incluida, para que una sola tarea sea dueña de una sola funcionalidad.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -324,6 +326,52 @@ def test_hard_cap_cuts_absurd_amount():
 
 def test_hard_cap_leaves_amount_below_limit():
     assert apply_hard_cap(Decimal("50"), Decimal("500")) == Decimal("50")
+
+# --- estrategia `risk` (spec §4.3.1) ---
+
+def test_risk_sizes_so_stop_loses_the_declared_fraction():
+    # capital 1000, riesgo 1% -> 10 USD en juego
+    # fracción estresada = 0.15 + 2*10/10000 + 2*10/10000 = 0.154
+    # importe = 10 / 0.154 = 64.93 (ROUND_DOWN a 2 decimales)
+    ctx = SizingContext(equity_usd=Decimal("1000"), stop_loss_pct=Decimal("15"),
+                        slippage_bps=10, fee_bps=10)
+    assert calculate_size(sig, risk_cfg(pct=1), ctx).amount_usd == Decimal("64.93")
+
+def test_risk_scales_with_equity():
+    # el doble de capital, el doble de importe
+    big = calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("2000"))).amount_usd
+    small = calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("1000"))).amount_usd
+    assert big == small * 2
+
+def test_risk_sizes_smaller_when_stop_is_wider():
+    # un stop más lejano exige una posición más pequeña para arriesgar lo mismo
+    near = calculate_size(sig, risk_cfg(pct=1), ctx_with(stop=Decimal("5"))).amount_usd
+    far  = calculate_size(sig, risk_cfg(pct=1), ctx_with(stop=Decimal("40"))).amount_usd
+    assert far < near
+
+def test_risk_includes_slippage_and_fees_on_both_legs():
+    # sin costes la fracción es 0.15 -> 66.66; con ellos sale menos
+    clean = calculate_size(sig, risk_cfg(pct=1), ctx_with(slip=0, fee=0)).amount_usd
+    assert clean == Decimal("66.66")
+    assert calculate_size(sig, risk_cfg(pct=1), ctx_with(slip=10, fee=10)).amount_usd < clean
+
+def test_risk_without_stop_loss_raises():
+    # sin stop no hay distancia que medir; la configuración ya lo impide, esto es la segunda red
+    with pytest.raises(ValueError, match="stop_loss_pct"):
+        calculate_size(sig, risk_cfg(pct=1), ctx_with(stop=None))
+
+def test_risk_with_zero_equity_returns_zero():
+    assert calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("0"))).amount_usd == Decimal("0")
+
+# --- reglas cruzadas nuevas en core/config.py ---
+
+def test_risk_strategy_requires_risk_pct():
+    with pytest.raises(ConfigError, match="risk_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=None, stop_loss_pct=15))
+
+def test_risk_strategy_requires_stop_loss():
+    with pytest.raises(ConfigError, match="stop_loss_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=1, stop_loss_pct=None))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -333,7 +381,18 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `calculate_size` y `apply_hard_cap` en `core/rules/sizing.py`**
 
-Función pura, sin E/S. El redondeo del resultado de `mirror` es a 2 decimales con `ROUND_DOWN`: redondear hacia abajo nunca gasta más de lo que la regla permite.
+Función pura, sin E/S. El redondeo de `mirror` y de `risk` es a 2 decimales con `ROUND_DOWN`: redondear hacia abajo nunca gasta más de lo que la regla permite.
+
+La fórmula de `risk` es la del spec §4.3.1:
+
+```
+fracción_estresada = stop_loss_pct/100 + 2*slippage_bps/10000 + 2*fee_bps/10000
+amount_usd         = (equity_usd * risk_pct/100) / fracción_estresada
+```
+
+El factor 2 en deslizamiento y comisión no es un adorno: hay una pata de entrada y otra de salida, y el stop no se ejecuta en su precio exacto sino algo peor. Omitirlo hace que el riesgo real supere siempre al declarado, que es el fallo que esta estrategia existe para evitar.
+
+`equity_usd` lo obtiene el motor (Tarea 12) de `MarketDataSource.get_balance()`. Con capital cero el importe es cero y no se lanza: es un estado legítimo, no un error.
 
 - [ ] **Step 4: Run test to verify it passes**
 

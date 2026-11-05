@@ -186,15 +186,42 @@ Razón para separarlos: un stop-loss que solo se comprueba una vez por hora no e
 
 ### 4.3 Tamaño de posición
 
-Dos estrategias, exclusivas entre sí:
+Tres estrategias, exclusivas entre sí:
 
 | Estrategia | Comportamiento |
 |---|---|
-| `flat` | Importe fijo en USD por compra. `flat_amount_usd: 50` |
+| `flat` | Importe fijo en USD por compra. `flat_amount_usd: 25` |
 | `mirror` | Porcentaje del tamaño del trader, con tope. `mirror_pct: 10`, `mirror_cap_usd: 200` |
+| `risk` | Importe tal que la pérdida al tocar el stop sea un porcentaje fijo del capital |
 
 En `mirror`, si el tamaño del trader no está disponible en la fuente, se cae a `flat` y se
 notifica. Nunca se adivina un tamaño.
+
+### 4.3.1 Dimensionar por riesgo
+
+La estrategia `risk` calcula el importe a partir de lo que se está dispuesto a perder, no de
+una cantidad arbitraria:
+
+```
+riesgo_usd        = capital × risk_pct
+fracción_estresada = stop_loss_pct/100
+                   + 2 × slippage_bps/10000      (deslizamiento de entrada y de stop)
+                   + 2 × fee_bps/10000           (comisión de entrada y de salida)
+importe_usd       = riesgo_usd / fracción_estresada
+```
+
+Por qué es mejor que el importe fijo: con `flat`, una compra de 25 USD en un activo con stop
+al 5 % arriesga 1,25 USD, y la misma compra con stop al 40 % arriesga 10. El riesgo real por
+operación varía ocho veces sin que nadie lo haya decidido. Con `risk`, **toda operación
+arriesga lo mismo**, que es lo que permite razonar sobre la pérdida máxima de una racha.
+
+La fracción es *estresada* a propósito: el stop no se ejecuta en su precio exacto sino algo
+peor, y hay comisión en las dos patas. Ignorarlo hace que el riesgo real supere siempre al
+declarado.
+
+`risk` exige `stop_loss_pct` configurado: sin stop no hay distancia que medir, y la
+configuración no valida esa combinación. El techo duro por orden (§7.3) se aplica después,
+como con cualquier otra estrategia.
 
 Sobre el resultado de cualquier estrategia se aplica el **techo duro por orden** (§7.3), que es
 independiente de estas reglas y actúa como último filtro.
@@ -217,6 +244,38 @@ De las condiciones 2–4 la configuración elige **una** como salida primaria. S
 time-stop pueden coexistir con ella como red de seguridad.
 
 En modo real, el stop-loss es **obligatorio**. La configuración no valida sin él.
+
+### 4.4.1 El stop vive en el exchange, no en el bot
+
+Al abrir una posición en modo real se coloca, además de la orden de entrada, una **orden stop
+reduce-only en el propio mercado**, al precio del stop-loss configurado.
+
+Razón: un stop-loss evaluado por el bucle de salida solo protege mientras el bot está vivo. Si
+el proceso muere, el portátil se suspende o se cae la conexión, la posición queda sin
+protección justo cuando más falta hace. Una orden en reposo en el exchange se ejecuta aunque
+todo lo del usuario esté apagado.
+
+Consecuencias de diseño:
+
+- El bucle de salida sigue existiendo: evalúa `copy_sell`, `take_profit`, `trailing` y
+  `time_stop`, que el exchange no puede conocer. El stop en el mercado es una red por debajo,
+  no un reemplazo.
+- **Reconciliación de stops.** Al arrancar, y en cada ciclo de salida, el bot comprueba que
+  cada posición abierta tiene su stop vivo en el mercado. Si falta, lo recoloca y avisa.
+- **Cancelación al cerrar.** Al cerrar una posición por cualquier otra vía, su stop se cancela.
+  Un stop huérfano puede ejecutarse más tarde y abrir una posición corta no deseada.
+- **Posición desprotegida con plazo.** Si tras `unprotected_deadline_seconds` (120 por defecto)
+  una posición sigue sin stop confirmado en el mercado, el bot la cierra a mercado. Es
+  preferible salir plano a quedarse expuesto sin red.
+- Los mercados que no admiten órdenes stop en reposo (según el adaptador) se marcan en
+  configuración y el bot lo advierte al arrancar en modo real: en ellos el stop solo existe
+  mientras el proceso viva.
+
+**Cuándo se construye.** Las órdenes stop en reposo son mecánica de ejecución real y llegan con
+el adaptador correspondiente (plan 3). Hasta entonces, el bucle de salida que comprueba precios
+cada 60 s cubre la misma condición con la única diferencia de la granularidad temporal. La
+diferencia importa cuando hay dinero real y el proceso puede morir; con dinero simulado y el
+proceso vivo, no.
 
 ### 4.5 Gates de riesgo
 
