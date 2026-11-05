@@ -1415,6 +1415,13 @@ Expected: FAIL con `ModuleNotFoundError`
 
 `ConfigError` se captura en la frontera de la CLI y se muestra como mensaje, no como traza.
 
+**Protecciones omitidas: romper el silencio.** Las protecciones valen `0` por defecto, y `0` las desactiva. Eso significa que una configuración que simplemente **no escriba** la sección `protections` corre sin ninguna de las cuatro y sin ninguna señal. El `extra="forbid"` atrapa una errata *dentro* de la sección, pero no una sección ausente. Por tanto, en el arranque:
+
+- En `mode: live`, la clave `protections` **debe estar presente**. Así, correr sin protecciones es una decisión explícita y escrita, no un olvido. Si falta, `ConfigError`.
+- En `paper` y en `backtest`, si las cuatro están a cero se emite un **aviso** al arrancar, por el notificador y por la salida estándar, diciendo cuáles están desactivadas.
+
+Tests: `mode: live` sin sección `protections` lanza `ConfigError` nombrando la clave; `mode: paper` con todo a cero arranca pero avisa; una configuración con protecciones activas no avisa.
+
 `run` monta dos trabajos independientes con **`apscheduler` (3.11.3, ya instalado)**: `CronTrigger` para la entrada con `cadence.entry_cron`, e `IntervalTrigger` para la salida con `cadence.exit_interval_seconds`. `--once` ejecuta un ciclo de cada uno y termina, sin planificador.
 
 Razón para no escribirlo a mano: un bucle propio hay que enseñarle qué hacer cuando un ciclo tarda más que su intervalo, cuando el equipo se suspende y se pierden disparos, y cuando hay que reanudar tras un reinicio. `apscheduler` ya resuelve los tres. Configúralo con `max_instances=1` y `coalesce=True`: si el equipo despierta tras dos horas suspendido, se ejecuta **un** ciclo de entrada, no dos encolados, y nunca dos ciclos a la vez sobre la misma base de datos.
