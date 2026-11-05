@@ -146,6 +146,15 @@ def test_quantity_precision_defaults_per_market():
 
 def test_execution_values_overridable_from_yaml():
     assert load_config(yaml_with_cex_slippage(42)).execution[Market.CEX].slippage_bps == 42
+
+def test_example_config_loads_with_conservative_defaults():
+    c = load_config(Path("config/config.example.yaml"))
+    assert c.mode is Mode.PAPER
+    assert c.sizing.flat_amount_usd == Decimal("25")
+    assert c.exits.stop_loss_pct == Decimal("15") and c.exits.trailing is False
+    assert (c.risk.max_open_positions, c.risk.max_usd_per_token) == (5, Decimal("50"))
+    assert c.risk.max_daily_loss_usd == Decimal("50")
+    assert c.risk.hard_max_order_usd == Decimal("50")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -159,7 +168,24 @@ Un validador de modelo en `BotConfig` aplica las reglas cruzadas: `stop_loss_pct
 
 `execution` se rellena por mercado con los valores por defecto de los tests cuando el YAML no los da, y el YAML puede sobrescribir cualquiera. Los valores viven en configuración y no en el código porque el spec §6.2 exige que el deslizamiento sea ajustable y más alto donde hay menos liquidez.
 
-`config/config.example.yaml` lleva los valores por defecto del spec §4.3 y §4.5. `config/.env.example` documenta las claves del spec §7.5, con el comentario de que las de exchange deben crearse **sin permiso de retirada**.
+`config/config.example.yaml` lleva **exactamente** estos valores, elegidos para limitar la pérdida máxima antes que para maximizar la ganancia:
+
+```yaml
+mode: paper
+sizing:   { strategy: flat, flat_amount_usd: 25 }
+exits:    { stop_loss_pct: 15, primary: copy_sell, time_stop_hours: 72, trailing: false }
+risk:
+  max_usd_per_token:   50
+  max_open_positions:  5
+  max_usd_per_day:     150
+  max_daily_loss_usd:  50
+  hard_max_order_usd:  50
+cadence:  { entry_cron: "0 * * * *", exit_interval_seconds: 60 }
+```
+
+La aritmética que justifica estos números: 5 posiciones × 50 USD de tope por token = 250 USD de exposición máxima simultánea, y el bot se apaga solo al perder 50 en un día. La salida primaria es `copy_sell` porque copiar la salida del trader es lo que significa copy-trading; el stop-loss al 15 % y el time-stop de 72 h son redes de seguridad por debajo, no la estrategia. El trailing va desactivado porque persigue máximos y en activos ruidosos cierra antes de tiempo.
+
+Un test comprueba que el fichero de ejemplo carga sin errores y produce estos valores. `config/.env.example` documenta las claves del spec §7.5, con el comentario de que las de exchange deben crearse **sin permiso de retirada**.
 
 - [ ] **Step 4: Run test to verify it passes**
 
