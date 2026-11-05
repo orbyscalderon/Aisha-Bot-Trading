@@ -64,3 +64,10 @@ def test_clamp_cursor_rejects_future_timestamp():
 
 def test_clamp_cursor_keeps_past_timestamp():
     assert clamp_cursor(NOW - timedelta(minutes=5), NOW) == NOW - timedelta(minutes=5)
+
+
+def test_empty_allowlist_is_frozen_and_not_refrozen(repo):
+    # Un frozenset vacío es falso pero no es "ausente": seguir a cero traders
+    # es un estado legítimo y no debe reescribirse en la segunda llamada.
+    assert ensure_frozen_allowlist("s1", set(), repo) == frozenset()
+    assert ensure_frozen_allowlist("s1", {"t1"}, repo) == frozenset()

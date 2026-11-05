@@ -63,5 +63,10 @@ def detect_new_traders(following: Iterable[str], frozen: Collection[str]) -> set
 
 
 def clamp_cursor(candidate: datetime, now: datetime) -> datetime:
-    """``min(candidate, now)``: el cursor nunca avanza más allá del presente."""
+    """``min(candidate, now)``: el cursor nunca avanza más allá del presente.
+
+    Ambos argumentos deben llevar ``tzinfo``: un naive lanza ``TypeError`` a
+    propósito (sería un bug en un adaptador de fuente; coercer la zona en
+    silencio lo escondería).
+    """
     return min(candidate, now)
