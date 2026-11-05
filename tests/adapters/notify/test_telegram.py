@@ -159,3 +159,28 @@ def test_console_notifier_does_not_propagate_output_errors(monkeypatch):
 
     monkeypatch.setattr("builtins.print", boom)
     ConsoleNotifier(Mode.PAPER).send("x", Level.INFO)
+
+
+def _real_client(status=200):
+    # Cliente httpx real con transporte simulado: no abre sockets ni resuelve DNS,
+    # pero sí atraviesa el logging propio de httpx (que escribe la URL completa).
+    return httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status)))
+
+
+@pytest.mark.parametrize("status", [200, 401, 429])
+def test_token_not_leaked_by_httpx_own_logger(caplog, status):
+    with caplog.at_level(logging.INFO):
+        TelegramNotifier(SECRET, "1", Mode.PAPER, client=_real_client(status)).send("x", Level.INFO)
+    assert any(r.name == "httpx" for r in caplog.records), "httpx debe seguir registrando"
+    assert SECRET not in caplog.text
+    assert "SECRET-TOKEN" not in caplog.text
+
+
+def test_encoded_token_in_url_pattern_is_redacted(caplog):
+    # forma transformada del token: no coincide literalmente, sí con /bot<...>/
+    exc = lambda url: httpx.ConnectError(  # noqa: E731
+        "fallo en https://api.telegram.org/bot123%3ASECRET-TOKEN-abc/sendMessage"
+    )
+    with caplog.at_level(logging.DEBUG):
+        TelegramNotifier(SECRET, "1", Mode.PAPER, client=RaisingClient(exc)).send("x", Level.INFO)
+    assert "SECRET-TOKEN" not in caplog.text
