@@ -52,7 +52,7 @@ from core.rules.risk import RiskAction, build_risk_state, evaluate_risk
 from core.rules.sizing import SizingContext, apply_hard_cap, calculate_size
 from core.safety import CircuitBreaker, is_kill_switch_active, mode_prefix
 from core.signals import clamp_cursor, ensure_frozen_allowlist, filter_by_allowlist
-from ports.market import MarketDataSource, OrderExecutor, QuoteUnavailable, ZeroQuantity
+from ports.market import MarketDataSource, OrderExecutor, OrderRejected, QuoteUnavailable
 from ports.notifier import Level, Notifier
 from ports.signal_source import SignalSource
 from storage.audit import AuditLog
@@ -287,14 +287,25 @@ class Engine:
         self._log("order_reserved", now, signal_id=signal.id, client_order_id=coid)
 
         order = Order(coid, signal.market, signal.symbol, Side.BUY, amount, quote.price)
+        self._mark_sent(coid)
         try:
-            self._repo.mark_intent_sent(coid)
             fill = self._executor.submit_buy(order)
-        except (ZeroQuantity, Exception) as exc:  # noqa: BLE001
+        except OrderRejected as exc:
+            # Rechazo definitivo: sabemos que no se ejecutó -> FAILED (reintentable).
             self._repo.mark_intent_failed(coid, repr(exc))
             self._breaker.record_failure()
             self._log("order_failed", now, client_order_id=coid, error=repr(exc))
-            self._notify(f"orden fallida {signal.symbol}: {exc!r}", Level.WARNING)
+            self._notify(f"orden rechazada {signal.symbol}: {exc!r}", Level.WARNING)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            # Fallo ambiguo: no sabemos si se ejecutó. El intent se queda en SENT
+            # (cola de reconciliación) y bloquea el reintento.
+            self._breaker.record_failure()
+            self._log("order_ambiguous", now, client_order_id=coid, error=repr(exc))
+            self._notify(
+                f"orden de resultado incierto {signal.symbol}: {exc!r}; "
+                "queda SENT hasta reconciliar", Level.CRITICAL,
+            )
             return False
 
         self._breaker.record_success()
@@ -310,6 +321,14 @@ class Engine:
                   price=fill.price, quantity=fill.quantity, amount_usd=amount)
         result.opened.append(position)
         return False
+
+    def _mark_sent(self, coid: str) -> None:
+        """RESERVED -> SENT. Si falla, la orden no salió: FAILED es seguro."""
+        try:
+            self._repo.mark_intent_sent(coid)
+        except Exception as exc:
+            self._repo.mark_intent_failed(coid, repr(exc))
+            raise
 
     def _update_peak_equity(self, equity: Decimal) -> Decimal:
         """Pico de capital persistido: si se perdiera al reiniciar, el drawdown se mediría
@@ -387,12 +406,16 @@ class Engine:
                   reason=decision.reason.value)
         order = Order(coid, position.market, position.symbol, Side.SELL, position.amount_usd,
                       quote.price, position_id=position.id, quantity=position.quantity)
+        self._mark_sent(coid)
         try:
-            self._repo.mark_intent_sent(coid)
             fill = self._executor.submit_sell(order)
-        except Exception as exc:  # noqa: BLE001
+        except OrderRejected as exc:
             self._repo.mark_intent_failed(coid, repr(exc))
             self._log("order_failed", now, client_order_id=coid, error=repr(exc))
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Ambiguo: el intent se queda en SENT y bloquea el reintento.
+            self._log("order_ambiguous", now, client_order_id=coid, error=repr(exc))
             raise
         if fill.position_id is None:
             fill = replace(fill, position_id=position.id)

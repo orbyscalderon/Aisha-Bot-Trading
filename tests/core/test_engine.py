@@ -10,7 +10,9 @@ from core.models import (
 )
 from core.portfolio import Portfolio
 from core.safety import CircuitBreaker
-from ports.market import MarketDataSource, OrderExecutor, QuoteUnavailable, ZeroQuantity
+from ports.market import (
+    MarketDataSource, OrderExecutor, OrderRejected, QuoteUnavailable, ZeroQuantity,
+)
 from ports.notifier import Level, Notifier
 from ports.signal_source import SignalSource
 from storage.audit import AuditLog
@@ -321,7 +323,7 @@ def test_exit_cycle_survives_missing_quote(make_env):
 
 
 def test_circuit_breaker_opens_after_three_failed_orders(make_env):
-    env = make_env(executor=FakeExecutor(fail=RuntimeError("exchange caído")))
+    env = make_env(executor=FakeExecutor(fail=OrderRejected("rechazada")))
     signals = [sig(f"s{i}", symbol=f"A{i}/USDT") for i in range(3)]
     env.engine.run_entry_cycle(FakeSource(signals), NOW)
     assert env.engine.circuit_breaker.is_open is True
@@ -330,7 +332,7 @@ def test_circuit_breaker_opens_after_three_failed_orders(make_env):
 
 
 def test_open_circuit_breaker_blocks_further_entries(make_env):
-    env = make_env(executor=FakeExecutor(fail=RuntimeError("x")))
+    env = make_env(executor=FakeExecutor(fail=OrderRejected("x")))
     env.engine.run_entry_cycle(FakeSource([sig(f"s{i}", symbol=f"A{i}") for i in range(3)]), NOW)
     env.executor.fail = None
     r = env.engine.run_entry_cycle(FakeSource([sig("s9", symbol="Z")]), NOW)
@@ -480,7 +482,7 @@ def test_same_signal_reprocessed_with_a_different_now_does_not_duplicate(make_en
 
 def test_failed_exit_is_retried_next_cycle_and_closes(make_env):
     from datetime import timedelta
-    env = make_env(executor=FakeExecutor(fail=RuntimeError("exchange caído")))
+    env = make_env(executor=FakeExecutor(fail=OrderRejected("rechazada")))
     open_pos(env, entry=100)
     env.data.price = Decimal("80")
     r1 = env.engine.run_exit_cycle(NOW)
@@ -492,7 +494,7 @@ def test_failed_exit_is_retried_next_cycle_and_closes(make_env):
 
 
 def test_failed_entry_is_retried_with_same_signal(make_env):
-    env = make_env(executor=FakeExecutor(fail=RuntimeError("x")))
+    env = make_env(executor=FakeExecutor(fail=OrderRejected("x")))
     env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
     env.executor.fail = None
     r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
@@ -518,3 +520,45 @@ def test_stop_inside_window_blocks_for_the_whole_long_pause(make_env):
     env.repo.close_position(p.id, Decimal("80"), ExitReason.STOP_LOSS, NOW - timedelta(hours=20))
     r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
     assert r.rejected[0][1] is RejectReason.STOP_LOSS_STREAK
+
+
+def test_zero_quantity_is_a_definitive_rejection():
+    assert issubclass(ZeroQuantity, OrderRejected)
+
+
+def test_definitive_rejection_marks_failed_and_next_cycle_retries(make_env):
+    env = make_env(executor=FakeExecutor(fail=ZeroQuantity()))
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert env.repo.unconfirmed_intents() == []  # FAILED, no pendiente
+    env.executor.fail = None
+    r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert len(r.opened) == 1
+
+
+def test_ambiguous_failure_leaves_intent_sent_and_blocks_retry(make_env):
+    from core.idempotency import IntentStatus
+    env = make_env(executor=FakeExecutor(fail=TimeoutError("sin respuesta")))
+    r1 = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert r1.opened == []
+    (intent,) = env.repo.unconfirmed_intents()
+    assert intent.status is IntentStatus.SENT
+    assert "order_ambiguous" in env.events() and "order_failed" not in env.events()
+    env.executor.fail = None  # el exchange vuelve, pero no sabemos si se ejecutó
+    r2 = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert r2.opened == [] and r2.rejected[0][1] is RejectReason.DUPLICATE
+    assert len(env.executor.orders) == 1
+
+
+def test_ambiguous_exit_failure_stays_sent_and_is_not_retried(make_env):
+    from datetime import timedelta
+    from core.idempotency import IntentStatus
+    env = make_env(executor=FakeExecutor(fail=TimeoutError("sin respuesta")))
+    open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    r1 = env.engine.run_exit_cycle(NOW)
+    assert r1.closed == [] and len(r1.errors) == 1
+    (intent,) = env.repo.unconfirmed_intents()
+    assert intent.status is IntentStatus.SENT
+    env.executor.fail = None
+    r2 = env.engine.run_exit_cycle(NOW + timedelta(minutes=1))
+    assert r2.closed == [] and len(env.executor.orders) == 1

@@ -17,8 +17,17 @@ class QuoteUnavailable(Exception):
     """No hay cotización utilizable para el símbolo."""
 
 
-class ZeroQuantity(Exception):
-    """La orden resultaría en cantidad cero."""
+class OrderRejected(Exception):
+    """Rechazo DEFINITIVO: el mercado dijo que no, la orden no se ejecutó.
+
+    Es lo único que permite marcar un intent FAILED (reintentable). Cualquier otro
+    fallo tras enviar (timeout, conexión caída, respuesta ilegible) es ambiguo:
+    no sabemos si se ejecutó, y el intent debe quedar SENT.
+    """
+
+
+class ZeroQuantity(OrderRejected):
+    """La orden resultaría en cantidad cero: nunca llegó a enviarse."""
 
 
 class MarketDataSource(ABC):
