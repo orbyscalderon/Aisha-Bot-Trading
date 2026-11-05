@@ -1187,7 +1187,13 @@ Expected: FAIL con `ModuleNotFoundError`
 
 `run_backtest` construye un `Engine` real con `HistoricalSource` y `PaperExecutor`, y avanza el reloj en pasos de `step` desde `start` hasta `end`, llamando a `run_entry_cycle` y `run_exit_cycle` en cada paso con ese `now` simulado. Esto es lo que garantiza que backtest y operación en vivo compartan motor.
 
-`compute_metrics` usa `statistics` de la stdlib para el Sharpe; no hace falta `pandas` para esto y evita una dependencia pesada. Los ratios se redondean a 4 decimales. Toda división comprueba antes el divisor: con cero operaciones cerradas, las métricas valen cero en lugar de lanzar.
+**`compute_metrics` delega en `quantstats` (0.0.86, ya instalado) todo lo que sea estadística estándar**: drawdown máximo, Sharpe, Sortino, volatilidad, win rate, expectancy. Construye una serie de retornos a partir de los fills y se la pasa.
+
+Razón para no calcularlo a mano: el Sharpe anualizado, el drawdown sobre una curva con aportaciones y la expectancy tienen convenios sutiles que es fácil equivocar en silencio, y un número de rendimiento equivocado es peor que no tenerlo, porque se actúa sobre él. `quantstats` además genera un informe HTML completo con `qs.reports.html(...)`, que la CLI expone como `backtest --report <fichero>`.
+
+**Lo que NO se delega: `closes_by_reason`.** Esa métrica es propia de este bot y es la que dice si los umbrales están calibrados; se calcula aquí y se añade al informe.
+
+Toda división comprueba antes el divisor: con cero operaciones cerradas las métricas valen cero en lugar de lanzar, y ese camino se prueba **sin** llamar a `quantstats`, porque una serie vacía le hace devolver `NaN`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1409,7 +1415,11 @@ Expected: FAIL con `ModuleNotFoundError`
 
 `ConfigError` se captura en la frontera de la CLI y se muestra como mensaje, no como traza.
 
-`run` monta dos bucles independientes con los valores de `CadenceConfig`: entrada al inicio de cada hora y salida cada `exit_interval_seconds`. El planificador se inyecta para que los tests no esperen en tiempo real, y `--once` ejecuta un solo ciclo de cada uno y termina.
+`run` monta dos trabajos independientes con **`apscheduler` (3.11.3, ya instalado)**: `CronTrigger` para la entrada con `cadence.entry_cron`, e `IntervalTrigger` para la salida con `cadence.exit_interval_seconds`. `--once` ejecuta un ciclo de cada uno y termina, sin planificador.
+
+Razón para no escribirlo a mano: un bucle propio hay que enseñarle qué hacer cuando un ciclo tarda más que su intervalo, cuando el equipo se suspende y se pierden disparos, y cuando hay que reanudar tras un reinicio. `apscheduler` ya resuelve los tres. Configúralo con `max_instances=1` y `coalesce=True`: si el equipo despierta tras dos horas suspendido, se ejecuta **un** ciclo de entrada, no dos encolados, y nunca dos ciclos a la vez sobre la misma base de datos.
+
+El planificador se inyecta para que los tests no esperen en tiempo real.
 
 `pyproject.toml` fija `requires-python = ">=3.11"` y las dependencias: `pydantic`, `pyyaml`, `ccxt`, `typer`, `httpx`, y `pytest` en el grupo de desarrollo. El README documenta instalación, el fichero de configuración y los comandos.
 
@@ -1423,6 +1433,109 @@ Expected: PASS, toda la batería
 ```bash
 git add cli.py pyproject.toml README.md tests/test_cli.py
 git commit -m "feat(cli): añadir CLI, empaquetado y documentación"
+```
+
+---
+
+### Task 18: Protecciones
+
+**Se ejecuta después de la Tarea 11 y ANTES de la Tarea 12**, porque el motor las consume. El número es alto solo porque se añadió al plan más tarde.
+
+**Files:**
+- Create: `core/rules/protections.py`
+- Modify: `core/config.py` (sección `protections` y `groups`), `core/rules/risk.py` (invocación)
+- Test: `tests/core/rules/test_protections.py`
+
+**Interfaces:**
+- Consumes: `Position`, `Fill`, `ExitReason`, `RejectReason` (T1), `Portfolio` (T11).
+- Produces: `ProtectionsConfig` con `cooldown_minutes: int`, `stop_loss_streak: int`, `streak_window_hours: int`, `streak_pause_hours: int`, `max_drawdown_pct: Decimal`, `max_usd_per_group: Decimal`, y `groups: dict[str, list[str]]` en `BotConfig`. `evaluate_protections(symbol, amount_usd, state, cfg, now) -> ProtectionVerdict`. `ProtectionVerdict` congelada con `blocked: bool`, `reason: RejectReason | None`, `until: datetime | None`. Nuevos miembros de `RejectReason`: `COOLDOWN`, `STOP_LOSS_STREAK`, `MAX_DRAWDOWN`, `MAX_USD_PER_GROUP`. `group_of(symbol, groups) -> str`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_cooldown_blocks_reentry_after_a_loss():
+    # cerró en pérdida hace 30 min, cooldown 60 -> bloqueado
+    v = evaluate_protections("BONK", D50, state_with_loss("BONK", minutes_ago=30), cfg(cooldown=60), NOW)
+    assert v.blocked and v.reason is RejectReason.COOLDOWN
+
+def test_cooldown_expires():
+    v = evaluate_protections("BONK", D50, state_with_loss("BONK", minutes_ago=61), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+def test_cooldown_does_not_apply_to_a_profitable_close():
+    # solo las pérdidas enfrían; cerrar en ganancia no castiga
+    v = evaluate_protections("BONK", D50, state_with_win("BONK", minutes_ago=5), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+def test_cooldown_is_per_symbol():
+    v = evaluate_protections("WIF", D50, state_with_loss("BONK", minutes_ago=5), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+def test_stop_loss_streak_pauses_all_entries():
+    # 3 stop-loss en 24h -> bloquea cualquier símbolo, no solo los de la racha
+    v = evaluate_protections("ETH/USDT", D50, state_with_stops(3, hours=20), cfg(streak=3, window=24), NOW)
+    assert v.blocked and v.reason is RejectReason.STOP_LOSS_STREAK
+
+def test_stop_loss_streak_ignores_stops_outside_the_window():
+    v = evaluate_protections("ETH/USDT", D50, state_with_stops(3, hours=30), cfg(streak=3, window=24), NOW)
+    assert v.blocked is False
+
+def test_only_stop_loss_closes_count_towards_the_streak():
+    # tres cierres por time-stop no son una racha de stops
+    v = evaluate_protections("ETH/USDT", D50, state_with_closes(ExitReason.TIME_STOP, 3), cfg(streak=3), NOW)
+    assert v.blocked is False
+
+def test_max_drawdown_blocks_entries():
+    v = evaluate_protections("ETH/USDT", D50, state(peak=D1000, equity=D880), cfg(max_dd=10), NOW)
+    assert v.blocked and v.reason is RejectReason.MAX_DRAWDOWN
+
+def test_max_drawdown_allows_exactly_at_threshold():
+    # 900 desde un pico de 1000 es exactamente -10%: desigualdad estricta
+    assert evaluate_protections("ETH/USDT", D50, state(peak=D1000, equity=D900), cfg(max_dd=10), NOW).blocked is False
+
+def test_correlated_group_exposure_is_summed():
+    # BONK y WIF son el mismo grupo: 60+60 = 120 > 100
+    st = state(exposure={"BONK": D60}, groups={"solana_memes": ["BONK", "WIF"]})
+    v = evaluate_protections("WIF", D60, st, cfg(max_group=100), NOW)
+    assert v.blocked and v.reason is RejectReason.MAX_USD_PER_GROUP
+
+def test_symbols_in_different_groups_do_not_add_up():
+    st = state(exposure={"BONK": D60}, groups={"solana_memes": ["BONK"], "majors": ["ETH/USDT"]})
+    assert evaluate_protections("ETH/USDT", D60, st, cfg(max_group=100), NOW).blocked is False
+
+def test_ungrouped_symbol_is_its_own_group():
+    assert group_of("ETH/USDT", {"solana_memes": ["BONK"]}) == "ETH/USDT"
+
+def test_protections_never_block_exits():
+    # las protecciones solo se consultan en el camino de entrada
+    assert "exit" not in inspect.signature(evaluate_protections).parameters
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/core/rules/test_protections.py -v`
+Expected: FAIL con `ModuleNotFoundError`
+
+- [ ] **Step 3: Implement `evaluate_protections` y `group_of` en `core/rules/protections.py`**
+
+Función pura. Evalúa en este orden y devuelve en la primera coincidencia: racha de stop-loss (la más global), drawdown máximo, cooldown del símbolo, exposición del grupo. Todos los umbrales con desigualdad estricta, como el resto del proyecto.
+
+`group_of` devuelve el nombre del grupo que contiene el símbolo, o el propio símbolo si no está en ninguno. Así el límite por grupo nunca es más laxo que el límite por token.
+
+Las protecciones **solo bloquean entradas**. Una posición abierta se sigue vigilando y cerrando con normalidad pase lo que pase: si el drawdown dispara y además una posición toca su stop, la posición se cierra. Bloquear salidas convertiría una protección en una trampa.
+
+El motor (Tarea 12) las consulta **después** del apagado por pérdida diaria y **antes** de los gates de §4.5, porque su motivo es más informativo.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pytest tests/core/rules/test_protections.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/rules/protections.py core/config.py core/rules/risk.py tests/core/rules/test_protections.py
+git commit -m "feat(core): añadir protecciones de frecuencia y exposición por grupo"
 ```
 
 ---

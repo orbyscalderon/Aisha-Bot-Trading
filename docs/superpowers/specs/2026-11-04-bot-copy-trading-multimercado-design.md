@@ -292,6 +292,42 @@ se notifica; no se descarta en silencio.
 La última es distinta a propósito. Un bot que sigue operando después de cruzar su límite de
 pérdida diaria no tiene límite de pérdida diaria.
 
+### 4.5.1 Protecciones
+
+Los gates de §4.5 limitan **cuánto** se arriesga. Las protecciones limitan **con qué
+frecuencia**: impiden repetir un error mientras las condiciones que lo provocaron siguen ahí.
+La idea está tomada de las *protections* de freqtrade.
+
+| Protección | Dispara cuando | Efecto | Por defecto |
+|---|---|---|---|
+| `cooldown_minutes` | Se cierra una posición en pérdida | Prohíbe reabrir **ese símbolo** | 60 |
+| `stop_loss_streak` | N stop-loss dentro de `streak_window_hours` | Bloquea **toda** apertura durante `streak_pause_hours` | 3 en 24 h, pausa 12 h |
+| `max_drawdown_pct` | La caída desde el máximo histórico de capital supera el umbral | Bloquea aperturas hasta recuperar | 10 % |
+| `max_usd_per_group` | La exposición sumada de un grupo correlacionado lo supera | Rechaza esa compra | 100 |
+
+**Por qué el cooldown.** Hoy, si un trader seguido entra y sale tres veces en un token que se
+está desplomando, el bot le copia las tres y pierde las tres. Ninguna regla actual lo impide:
+cada operación por separado respeta el tamaño, el stop y los límites diarios. Lo que falla no
+es el tamaño de cada apuesta sino insistir en la misma apuesta perdedora.
+
+**Por qué la racha de stop-loss.** Tres stops seguidos no suelen ser mala suerte: suelen ser un
+cambio de régimen de mercado que el trader seguido todavía no ha asimilado. Parar doce horas
+cuesta las oportunidades de medio día; no parar cuesta el resto de la racha.
+
+**Por qué el límite por grupo correlacionado.** `max_open_positions: 5` trata cinco posiciones
+como diversificación. **Si son cinco memecoins de Solana, no son cinco apuestas: son una sola
+apuesta repetida cinco veces**, y caerán juntas. El límite por token no ve esa correlación
+porque mira símbolo a símbolo.
+
+Los grupos se declaran en configuración (`groups: {solana_memes: [BONK, WIF, ...]}`). Un
+símbolo que no aparece en ningún grupo forma su propio grupo de uno, de modo que el límite por
+grupo nunca es más laxo que el límite por token.
+
+**Dónde encajan.** Las protecciones se evalúan **después** del apagado por pérdida diaria y
+**antes** de los demás rechazos: son más específicas y su motivo es más informativo. Ninguna
+afecta a las salidas: una posición abierta se sigue vigilando y cerrando con normalidad, pase
+lo que pase con las protecciones. Bloquean entradas, nunca salidas.
+
 ### 4.6 Kill switch
 
 Un fichero llamado `STOP` en la raíz detiene toda apertura de posición en el siguiente ciclo.
