@@ -254,3 +254,13 @@ def test_audit_log_rejects_update_and_delete(conn):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM audit_log")
     assert conn.execute("SELECT event FROM audit_log").fetchone()[0] == "e"
+
+
+def test_closed_positions_since_filters_by_close_time(repo):
+    for id in ("a", "b", "c"):
+        repo.save_position(pos_with(id))
+    repo.close_position("a", Decimal("90"), ExitReason.STOP_LOSS, T0)
+    repo.close_position("b", Decimal("90"), ExitReason.STOP_LOSS, T1)
+    # "c" sigue abierta
+    assert [p.id for p in repo.closed_positions_since(T1)] == ["b"]
+    assert [p.id for p in repo.closed_positions_since(T0)] == ["a", "b"]

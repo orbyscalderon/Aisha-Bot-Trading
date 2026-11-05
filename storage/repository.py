@@ -102,6 +102,15 @@ class Repository:
         ).fetchall()
         return [_row_to_position(r) for r in rows]
 
+    def closed_positions_since(self, since: datetime) -> list[Position]:
+        """Posiciones cerradas con closed_at >= since, en orden de cierre."""
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE closed_at IS NOT NULL AND closed_at >= ?"
+            " ORDER BY closed_at, rowid",
+            (_ts(since),),
+        ).fetchall()
+        return [_row_to_position(r) for r in rows]
+
     def close_position(
         self, id: str, exit_price: Decimal, exit_reason: ExitReason, closed_at: datetime
     ) -> None:

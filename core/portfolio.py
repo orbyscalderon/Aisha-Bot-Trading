@@ -38,6 +38,10 @@ class Portfolio:
     def open_position_count(self) -> int:
         return len(self._repo.open_positions())
 
+    def closed_positions_since(self, since: datetime) -> list[Position]:
+        """Posiciones cerradas desde ``since``: insumo de las protecciones."""
+        return self._repo.closed_positions_since(since)
+
     def position_for_symbol(self, symbol: str) -> Position | None:
         for p in self._repo.open_positions():
             if p.symbol == symbol:
