@@ -19,7 +19,9 @@ from core.models import Side
 
 PREFIX = "ct-"
 HEX_LENGTH = 32  # 3 + 32 = 35 <= 36, límite de Binance y de la mayoría de CEX vía ccxt
-# Unit Separator (ASCII 0x1F): no aparece en ids, símbolos ni marcas de tiempo.
+# Unit Separator (ASCII 0x1F). Se verifica en client_order_id que no aparezca en
+# signal_id, trader_id ni symbol (ids de señal vienen de CSV); la marca de tiempo
+# generada no puede contenerlo.
 _SEP = "\x1f"
 
 
@@ -45,6 +47,16 @@ def client_order_id(
     """Identificador determinista: ct- + 32 hex de sha256 (35 caracteres)."""
     if cycle_ts.tzinfo is None or cycle_ts.utcoffset() is None:
         raise ValueError(f"naive datetime not allowed: {cycle_ts!r}")
+    for name, value in (("signal_id", signal_id), ("trader_id", trader_id), ("symbol", symbol)):
+        if _SEP in value:
+            raise ValueError(
+                f"{name} contains the reserved separator \x1f; refusing to build "
+                f"an ambiguous client_order_id: {value!r}"
+            )
+    # FORMATO CONGELADO: no cambiar timespec ni la normalización a UTC. Cualquier
+    # cambio altera todos los identificadores y la deduplicación dejaría de
+    # reconocer los intents en vuelo (órdenes de estado ambiguo) durante la
+    # actualización.
     ts = cycle_ts.astimezone(timezone.utc).isoformat(timespec="microseconds")
     raw = _SEP.join((signal_id, trader_id, symbol, Side(side).value, ts))
     return PREFIX + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:HEX_LENGTH]

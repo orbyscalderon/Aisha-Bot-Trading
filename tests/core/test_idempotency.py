@@ -202,3 +202,18 @@ def test_confirm_rejects_fill_of_other_order(repo):
     with pytest.raises(ValueError):
         repo.mark_intent_confirmed("c1", fill_for("otro"))
     assert len(repo.unconfirmed_intents()) == 1
+
+
+@pytest.mark.parametrize("field", ["signal_id", "trader_id", "symbol"])
+def test_client_order_id_rejects_separator_in_field(field):
+    args = {"signal_id": "s1", "trader_id": "t1", "symbol": "BTC/USDT"}
+    args[field] = "a\x1fb"
+    with pytest.raises(ValueError, match=field):
+        client_order_id(args["signal_id"], args["trader_id"], args["symbol"], Side.BUY, T0)
+
+
+def test_client_order_id_separator_shift_tuples_never_collide_silently():
+    # ("a\x1fb","c") y ("a","b\x1fc") darían el mismo raw: ahora ambos se rechazan.
+    for sid, tid in (("a\x1fb", "c"), ("a", "b\x1fc")):
+        with pytest.raises(ValueError):
+            client_order_id(sid, tid, "BTC/USDT", Side.BUY, T0)
