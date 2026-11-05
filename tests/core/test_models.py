@@ -176,3 +176,43 @@ def test_order_and_fill_position_fields_are_immutable():
         buy_order().position_id = "p2"
     with pytest.raises(FrozenInstanceError):
         base_fill().position_id = "p2"
+
+
+def test_valid_buy_order_constructs():
+    order = buy_order()
+    assert order.side is Side.BUY
+
+
+def test_valid_sell_order_constructs():
+    order = buy_order(side=Side.SELL, position_id="p1", quantity=Decimal("0.5"))
+    assert order.side is Side.SELL
+
+
+def test_buy_with_quantity_raises():
+    with pytest.raises(ValueError, match="buy"):
+        buy_order(quantity=Decimal("1"))
+
+
+def test_buy_with_position_id_raises():
+    with pytest.raises(ValueError, match="buy"):
+        buy_order(position_id="p1")
+
+
+def test_sell_without_position_id_raises():
+    with pytest.raises(ValueError, match="sell"):
+        buy_order(side=Side.SELL, quantity=Decimal("0.5"))
+
+
+def test_sell_with_none_quantity_raises():
+    with pytest.raises(ValueError, match="sell"):
+        buy_order(side=Side.SELL, position_id="p1", quantity=None)
+
+
+def test_sell_with_zero_quantity_raises():
+    with pytest.raises(ValueError, match="sell"):
+        buy_order(side=Side.SELL, position_id="p1", quantity=Decimal("0"))
+
+
+def test_buy_with_zero_amount_raises():
+    with pytest.raises(ValueError, match="buy"):
+        buy_order(amount_usd=Decimal("0"))

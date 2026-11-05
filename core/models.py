@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from enum import Enum, StrEnum
+from enum import StrEnum
 
 
 class Side(StrEnum):
@@ -84,6 +84,21 @@ class Order:
     # Una venta lleva position_id y quantity (cantidad de esa posición).
     position_id: str | None = None
     quantity: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if self.side is Side.BUY:
+            if self.amount_usd <= 0 or self.position_id is not None or self.quantity is not None:
+                raise ValueError(
+                    "buy order requires amount_usd > 0 and no position_id/quantity; "
+                    f"got amount_usd={self.amount_usd}, position_id={self.position_id!r}, "
+                    f"quantity={self.quantity}"
+                )
+        elif self.side is Side.SELL:
+            if self.position_id is None or self.quantity is None or self.quantity <= 0:
+                raise ValueError(
+                    "sell order requires position_id and quantity > 0; "
+                    f"got position_id={self.position_id!r}, quantity={self.quantity}"
+                )
 
 
 @dataclass(frozen=True, slots=True)
