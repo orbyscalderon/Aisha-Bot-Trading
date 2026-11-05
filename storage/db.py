@@ -1,6 +1,6 @@
 """Esquema SQLite y apertura de la conexión.
 
-Este módulo es dueño del esquema completo (seis tablas). Ninguna otra parte
+Este módulo es dueño del esquema completo (siete tablas). Ninguna otra parte
 del código ejecuta DDL.
 
 Convenios de almacenamiento (la conversión es explícita, ver repository.py):
@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS order_intents (
     payload          TEXT NOT NULL,
     created_at       TEXT NOT NULL,
     error            TEXT
+);
+
+-- Estado pequeño del bot que debe sobrevivir a un reinicio (p. ej. el pico de
+-- capital de la protección de drawdown). Decimales como texto.
+CREATE TABLE IF NOT EXISTS bot_state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
 );
 
 -- Solo-añadir por construcción: los triggers impiden UPDATE y DELETE.

@@ -27,8 +27,10 @@ Decisiones que el plan no fijaba:
   copia histórico al arrancar.
 - Con el circuit breaker abierto se detienen las ENTRADAS (no las salidas) y
   el cursor no avanza, para no perder las señales sin procesar.
-- El pico de capital para la protección de drawdown vive en memoria; se
-  pierde al reiniciar (la protección arranca sin historia).
+- El pico de capital (protección de drawdown) se persiste en ``bot_state``.
+- Si el apagado por pérdida diaria corta el ciclo, las señales pendientes se
+  descartan (una señal copiada horas tarde es una apuesta, no copy-trading),
+  pero se audita y se avisa cuántas fueron.
 """
 
 from __future__ import annotations
@@ -55,6 +57,9 @@ from ports.notifier import Level, Notifier
 from ports.signal_source import SignalSource
 from storage.audit import AuditLog
 from storage.repository import Repository
+
+
+_PEAK_KEY = "peak_equity_usd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +100,6 @@ class Engine:
         self._breaker = circuit_breaker
         self._root = project_root
         self._session_id = session_id
-        self._peak_equity = Decimal(0)
 
     @property
     def circuit_breaker(self) -> CircuitBreaker:
@@ -169,6 +173,8 @@ class Engine:
         following = self._cfg.allowlist or source.list_followed()
         allowlist = ensure_frozen_allowlist(self._session_id, following, self._repo)
 
+        # Sin cursor previo se pide desde ``now``: es lo que evita copiar al arrancar
+        # todo el histórico de un trader (operaciones viejas, a precio de hoy).
         since = self._repo.get_cursor(source.name) or now
         signals = source.fetch_trades(since)
         last_seen = max((s.timestamp for s in signals), default=None)
@@ -177,7 +183,7 @@ class Engine:
         for signal, reason in not_allowed:
             self._reject(result, signal, reason, now, trader_id=signal.trader_id)
 
-        for signal in accepted:
+        for index, signal in enumerate(accepted):
             if signal.side is not Side.BUY:
                 self._log("signal_ignored", now, signal_id=signal.id, side=signal.side.value)
                 continue
@@ -186,7 +192,15 @@ class Engine:
                 self._notify("circuit breaker abierto: ciclo detenido", Level.CRITICAL)
                 return True, False, last_seen
             if self._process_buy(signal, now, utc_day, result):
-                # Apagado por pérdida diaria: fin del ciclo (el cursor sí avanza).
+                # Apagado por pérdida diaria: fin del ciclo. El cursor avanza (no se
+                # ejecutan señales rancias), pero lo descartado se audita y se avisa.
+                discarded = len(accepted) - index - 1
+                self._log("signals_discarded_by_shutdown", now, discarded=discarded,
+                          source=source.name)
+                self._notify(
+                    f"apagado por pérdida diaria: {discarded} señales sin procesar descartadas",
+                    Level.WARNING,
+                )
                 return False, True, last_seen
         return False, False, last_seen
 
@@ -202,7 +216,7 @@ class Engine:
 
         exec_cfg = cfg.execution[signal.market]
         equity = self._data.get_balance()
-        self._peak_equity = max(self._peak_equity, equity)
+        peak_equity = self._update_peak_equity(equity)
         sized = calculate_size(
             signal, cfg.sizing,
             SizingContext(equity, cfg.exits.stop_loss_pct, exec_cfg.slippage_bps, exec_cfg.fee_bps),
@@ -235,7 +249,7 @@ class Engine:
 
         # 2. Protecciones: su motivo es más informativo que el de los gates.
         protection = evaluate_protections(
-            signal.symbol, amount, self._protection_state(exposure, equity, now),
+            signal.symbol, amount, self._protection_state(exposure, equity, peak_equity, now),
             cfg.protections, now,
         )
         if protection.blocked:
@@ -297,14 +311,25 @@ class Engine:
         result.opened.append(position)
         return False
 
+    def _update_peak_equity(self, equity: Decimal) -> Decimal:
+        """Pico de capital persistido: si se perdiera al reiniciar, el drawdown se mediría
+        desde el suelo y la protección se apagaría justo tras una caída."""
+        stored = self._repo.get_state(_PEAK_KEY)
+        peak = Decimal(stored) if stored is not None else equity
+        if stored is None or equity > peak:
+            peak = max(peak, equity)
+            self._repo.set_state(_PEAK_KEY, str(peak))
+        return peak
+
     def _protection_state(
-        self, exposure: dict[str, Decimal], equity: Decimal, now: datetime
+        self, exposure: dict[str, Decimal], equity: Decimal, peak_equity: Decimal,
+        now: datetime,
     ) -> ProtectionState:
         p = self._cfg.protections
         lookback = max(timedelta(hours=p.streak_window_hours), timedelta(minutes=p.cooldown_minutes))
         return ProtectionState(
             closed_positions=self._portfolio.closed_positions_since(now - lookback),
-            peak_equity_usd=self._peak_equity,
+            peak_equity_usd=peak_equity,
             equity_usd=equity,
             exposure_by_symbol=exposure,
             groups=self._cfg.groups,

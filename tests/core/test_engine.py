@@ -420,3 +420,46 @@ def test_exit_cycle_never_consults_protections(make_env, monkeypatch):
     env.data.price = Decimal("80")
     assert len(env.engine.run_exit_cycle(NOW).closed) == 1
     assert calls == []
+
+
+def test_peak_equity_initialised_to_current_equity(make_env):
+    env = make_env()
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert Decimal(env.repo.get_state("peak_equity_usd")) == Decimal("10000")
+
+
+def test_higher_equity_raises_the_persisted_peak(make_env):
+    env = make_env()
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    env.data.balance = Decimal("12000")
+    env.engine.run_entry_cycle(FakeSource([sig("s2", symbol="ETH/USDT")]), NOW)
+    assert Decimal(env.repo.get_state("peak_equity_usd")) == Decimal("12000")
+
+
+def test_lower_equity_does_not_lower_the_persisted_peak(make_env):
+    env = make_env()
+    env.repo.set_state("peak_equity_usd", "15000")
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert Decimal(env.repo.get_state("peak_equity_usd")) == Decimal("15000")
+
+
+def test_drawdown_protection_survives_an_engine_restart(make_env):
+    # Pico guardado 15000, capital actual 10000: drawdown 33 % > 10 %.
+    env = make_env(cfg=make_cfg(protections={"max_drawdown_pct": 10}))
+    env.repo.set_state("peak_equity_usd", "15000")
+    restarted = env.build(env.engine._cfg)  # motor nuevo, mismo repositorio
+    r = restarted.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert r.opened == [] and r.rejected[0][1] is RejectReason.MAX_DRAWDOWN
+
+
+def test_shutdown_audits_and_warns_about_discarded_signals(make_env):
+    env = make_env()
+    p = open_pos(env)
+    env.repo.close_position(p.id, Decimal("50"), ExitReason.STOP_LOSS, NOW)
+    env.repo.save_fill(Fill("f-x", "ct-x", Market.CEX, "BTC/USDT", Side.SELL, Decimal("-500"),
+                            Decimal("1"), Decimal("0"), NOW, position_id=p.id))
+    signals = [sig("s1"), sig("s2", symbol="ETH/USDT"), sig("s3", symbol="SOL/USDT")]
+    env.engine.run_entry_cycle(FakeSource(signals), NOW)
+    ev = [e for e in env.audit.events() if e.event == "signals_discarded_by_shutdown"]
+    assert len(ev) == 1 and ev[0].payload["discarded"] == 2
+    assert any(level is Level.WARNING and "2" in msg for msg, level in env.notifier.sent)

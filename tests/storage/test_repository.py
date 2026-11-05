@@ -264,3 +264,19 @@ def test_closed_positions_since_filters_by_close_time(repo):
     # "c" sigue abierta
     assert [p.id for p in repo.closed_positions_since(T1)] == ["b"]
     assert [p.id for p in repo.closed_positions_since(T0)] == ["a", "b"]
+
+
+def test_state_roundtrip_and_missing_key(repo):
+    assert repo.get_state("peak_equity_usd") is None
+    repo.set_state("peak_equity_usd", "1234.5")
+    repo.set_state("peak_equity_usd", "2000")  # sobrescribe
+    assert repo.get_state("peak_equity_usd") == "2000"
+
+
+def test_state_survives_closing_and_reopening_the_database(tmp_path):
+    c = init_db(tmp_path / "x.db")
+    Repository(c).set_state("k", "v")
+    c.close()
+    c2 = init_db(tmp_path / "x.db")
+    assert Repository(c2).get_state("k") == "v"
+    c2.close()

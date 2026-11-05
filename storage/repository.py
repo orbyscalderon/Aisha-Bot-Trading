@@ -189,6 +189,20 @@ class Repository:
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"allowlist already frozen for session {session_id!r}") from exc
 
+    # --- estado persistente del bot ---------------------------------------
+
+    def get_state(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row is not None else None
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO bot_state (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
     # --- intenciones de orden (idempotencia) -----------------------------
 
     def reserve_intent(
