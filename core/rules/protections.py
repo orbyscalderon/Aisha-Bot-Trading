@@ -13,7 +13,8 @@ trampa. Por eso la función ni siquiera recibe una posición que cerrar.
 Orden fijo, devuelve en la primera coincidencia (el veredicto más global es el
 más informativo):
 
-1. Racha de stop-loss. Solo cuentan los cierres ``STOP_LOSS``.
+1. Racha de stop-loss. Solo cuentan los cierres ``STOP_LOSS``. La ventana
+   detecta la racha; la pausa (desde su último stop) fija la duración del bloqueo.
 2. Drawdown máximo.
 3. Cooldown del símbolo tras un cierre en pérdida.
 4. Exposición del grupo correlacionado.
@@ -70,19 +71,31 @@ def _is_loss(p: Position) -> bool:
 
 
 def _streak(state: ProtectionState, cfg: ProtectionsConfig, now: datetime) -> ProtectionVerdict:
-    if cfg.stop_loss_streak <= 0:
+    """La ventana DETECTA la racha (N stops juntos); la pausa dice CUÁNTO dura el bloqueo.
+
+    Se busca la racha más reciente: el stop más nuevo que, junto a los N-1
+    anteriores, cabe estrictamente dentro de la ventana. El bloqueo dura
+    ``streak_pause_hours`` desde ese último stop, aunque la pausa supere la
+    ventana y los stops ya no estén dentro de ella.
+    """
+    n = cfg.stop_loss_streak
+    if n <= 0:
         return _ALLOW
-    window_start = now - timedelta(hours=cfg.streak_window_hours)
-    stops = [
-        p.closed_at
-        for p in state.closed_positions
-        if p.exit_reason is ExitReason.STOP_LOSS and p.closed_at is not None and p.closed_at > window_start
-    ]
-    if len(stops) < cfg.stop_loss_streak:
-        return _ALLOW
-    until = max(stops) + timedelta(hours=cfg.streak_pause_hours)
-    if now < until:
-        return ProtectionVerdict(True, RejectReason.STOP_LOSS_STREAK, until)
+    stops = sorted(
+        (
+            p.closed_at
+            for p in state.closed_positions
+            if p.exit_reason is ExitReason.STOP_LOSS and p.closed_at is not None
+        ),
+        reverse=True,
+    )
+    window = timedelta(hours=cfg.streak_window_hours)
+    for i in range(len(stops) - n + 1):
+        if stops[i] - stops[i + n - 1] < window:
+            until = stops[i] + timedelta(hours=cfg.streak_pause_hours)
+            if now < until:
+                return ProtectionVerdict(True, RejectReason.STOP_LOSS_STREAK, until)
+            return _ALLOW  # las rachas más viejas acaban antes
     return _ALLOW
 
 

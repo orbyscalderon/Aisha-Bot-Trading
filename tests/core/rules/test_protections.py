@@ -59,6 +59,10 @@ def state_with_stops(n, hours):
     return state([closed(f"T{i}", ExitReason.STOP_LOSS, timedelta(hours=hours), n=i) for i in range(n)])
 
 
+def state_with_stops_at(*hours_ago):
+    return state([closed(f"T{i}", ExitReason.STOP_LOSS, timedelta(hours=h), n=i) for i, h in enumerate(hours_ago)])
+
+
 def state_with_closes(reason, n):
     return state([closed(f"T{i}", reason, timedelta(hours=1), n=i) for i in range(n)])
 
@@ -167,9 +171,40 @@ def test_streak_pause_ending_exactly_now_does_not_block():
     assert v.blocked is False
 
 
-def test_stop_exactly_at_window_start_is_outside_the_window():
-    v = evaluate_protections("X", D50, state_with_stops(3, hours=24), cfg(streak=3, window=24, pause=48), NOW)
+def test_stops_exactly_a_window_apart_are_not_a_streak():
+    # el primero y el tercero distan exactamente la ventana: desigualdad estricta
+    st = state_with_stops_at(1, 13, 25)
+    assert evaluate_protections("X", D50, st, cfg(streak=3, window=24, pause=48), NOW).blocked is False
+
+
+def test_pause_longer_than_window_keeps_blocking_after_the_window():
+    # 3 stops hace 30 h: ya fuera de la ventana de 24 h, pero la pausa de 48 h manda
+    v = evaluate_protections("X", D50, state_with_stops(3, hours=30), cfg(streak=3, window=24, pause=48), NOW)
+    assert v.blocked and v.reason is RejectReason.STOP_LOSS_STREAK
+    assert v.until == NOW - timedelta(hours=30) + timedelta(hours=48)
+
+
+def test_long_pause_expires_after_pause_hours():
+    v = evaluate_protections("X", D50, state_with_stops(3, hours=49), cfg(streak=3, window=24, pause=48), NOW)
     assert v.blocked is False
+
+
+def test_pause_shorter_than_window_is_unchanged():
+    v = evaluate_protections("X", D50, state_with_stops(3, hours=5), cfg(streak=3, window=24, pause=12), NOW)
+    assert v.blocked and v.until == NOW - timedelta(hours=5) + timedelta(hours=12)
+
+
+def test_spread_out_stops_never_form_a_streak():
+    # 0 h, 30 h y 60 h con ventana 24 h: tres stops, pero nunca tres juntos
+    st = state_with_stops_at(1, 31, 61)
+    assert evaluate_protections("X", D50, st, cfg(streak=3, window=24, pause=100), NOW).blocked is False
+
+
+def test_streak_is_anchored_on_the_latest_cluster():
+    # un stop viejo suelto no impide detectar el grupo reciente
+    st = state_with_stops_at(2, 3, 4, 90)
+    v = evaluate_protections("X", D50, st, cfg(streak=3, window=24, pause=48), NOW)
+    assert v.blocked and v.until == NOW - timedelta(hours=2) + timedelta(hours=48)
 
 
 def test_one_stop_short_of_the_streak_does_not_block():
