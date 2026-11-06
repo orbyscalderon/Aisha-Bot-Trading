@@ -157,21 +157,58 @@ def default_scheduler() -> BlockingScheduler:
     return BlockingScheduler(timezone=timezone.utc)
 
 
-def build_jobs(engine: Engine, source: Any) -> tuple[Callable[[], None], Callable[[], None]]:
+def exit_lock_timeout(exit_interval_seconds: float) -> float:
+    """Cuánto espera el ciclo de salida a que la entrada suelte el cerrojo.
+
+    Mayor que el intervalo de salida, para no avisar por solapes normales, y acotado
+    para que un ciclo de entrada colgado no silencie las salidas indefinidamente.
+    """
+    return exit_interval_seconds * 2 + 5
+
+
+def build_jobs(
+    engine: Engine,
+    source: Any,
+    *,
+    notifier: Notifier | None = None,
+    audit: Any = None,
+    lock_timeout: float | None = None,
+) -> tuple[Callable[[], None], Callable[[], None]]:
     """Funciones de entrada y salida que comparten un cerrojo.
 
     ``max_instances=1`` impide solapar un job consigo mismo; el cerrojo impide que la
     entrada y la salida toquen la misma base de datos a la vez.
+
+    El ciclo de salida adquiere el cerrojo **con tiempo límite**. Sin él, un ciclo de
+    entrada colgado —una llamada al exchange que no vuelve— se quedaría con el cerrojo,
+    la salida esperaría para siempre y ``max_instances=1`` haría que las siguientes se
+    saltaran: los stop-loss dejarían de dispararse con posiciones abiertas, sin que
+    nada fallara a la vista. Al expirar NO se ejecuta sin cerrojo (dos ciclos sobre la
+    misma base es otro problema): se avisa con nivel CRITICAL y se audita.
     """
     lock = threading.Lock()
+    timeout = exit_lock_timeout(60) if lock_timeout is None else lock_timeout
 
     def entry() -> None:
         with lock:
             engine.run_entry_cycle(source, datetime.now(timezone.utc))
 
     def exit_() -> None:
-        with lock:
+        if not lock.acquire(timeout=timeout):
+            message = (
+                "el ciclo de salida no pudo ejecutarse: el de entrada lleva más de "
+                f"{timeout:g} s ocupando el cerrojo. Las posiciones abiertas están "
+                "sin vigilar hasta que se libere."
+            )
+            if audit is not None:
+                audit.record("exit_cycle_skipped_lock_timeout", {"timeout_seconds": str(timeout)})
+            if notifier is not None:
+                notifier.send(message, Level.CRITICAL)
+            return
+        try:
             engine.run_exit_cycle(datetime.now(timezone.utc))
+        finally:
+            lock.release()
 
     return entry, exit_
 
@@ -295,14 +332,25 @@ def run(
     except ValueError as exc:
         raise _fail(f"error de configuración: cadence.entry_cron inválido ({cfg.cadence.entry_cron!r}): {exc}", 2) from None
 
+    # Validar el CSV AL ARRANCAR. `CexCsvSignalSource` lo lee perezosamente dentro del
+    # ciclo, así que un fichero ausente o malformado saldría como traza cruda a mitad de
+    # ejecución en vez de como mensaje al empezar.
+    _read_signals(signals)
+
     _say(cfg, f"arrancando en simulado (config {cfg.fingerprint()[:12]})")
-    engine, notifier = _build(
-        cfg, root, exchange_id=exchange, data_source=deps.data_source,
-        notifier=deps.notifier, paper_capital=_parse_capital(capital),
-    )
+    try:
+        engine, notifier = _build(
+            cfg, root, exchange_id=exchange, data_source=deps.data_source,
+            notifier=deps.notifier, paper_capital=_parse_capital(capital),
+        )
+    except (ValueError, AttributeError) as exc:
+        raise _fail(f"exchange no válido {exchange!r}: {type(exc).__name__}: {exc}", 2) from None
     warn_if_no_protections(cfg, notifier)
     source = CexCsvSignalSource(signals)
-    entry_job, exit_job = build_jobs(engine, source)
+    entry_job, exit_job = build_jobs(
+        engine, source, notifier=notifier, audit=getattr(engine, "_audit", None),
+        lock_timeout=exit_lock_timeout(cfg.cadence.exit_interval_seconds),
+    )
 
     if once:
         now = datetime.now(timezone.utc)

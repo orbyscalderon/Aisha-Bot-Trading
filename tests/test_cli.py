@@ -468,3 +468,83 @@ def test_build_engine_passes_ignore_assets_to_the_cex_adapter(tmp_path, root, mo
     p = write_yaml(tmp_path / "cex.yaml", cex={"ignore_assets": ["LDBNB", "FAUCET"]})
     build_engine(load_config(p), root, notifier=RecordingNotifier())
     assert list(seen["ignore_assets"]) == ["LDBNB", "FAUCET"]
+
+
+# --- cerrojo con tiempo límite: las salidas nunca se quedan esperando en silencio ---
+
+class FakeAudit:
+    def __init__(self):
+        self.events = []
+
+    def record(self, event, payload, now=None):
+        self.events.append((event, payload))
+
+
+def test_exit_cycle_times_out_notifies_critical_and_does_not_hang():
+    release = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    class HungEntryEngine:
+        def run_entry_cycle(self, source, now):
+            started.set()
+            release.wait(5)
+
+        def run_exit_cycle(self, now):
+            calls.append("exit")
+
+    notifier, audit = RecordingNotifier(), FakeAudit()
+    entry, exit_ = cli.build_jobs(HungEntryEngine(), object(), notifier=notifier,
+                                  audit=audit, lock_timeout=0.1)
+    t = threading.Thread(target=entry)
+    t.start()
+    assert started.wait(2)
+    began = time.monotonic()
+    exit_()  # no debe colgarse
+    elapsed = time.monotonic() - began
+    release.set()
+    t.join()
+    assert elapsed < 2
+    assert calls == []  # sin cerrojo no se fuerza la ejecución
+    critical = [m for m, lvl in notifier.sent if lvl is Level.CRITICAL]
+    assert critical and "salida" in critical[0] and "sin vigilar" in critical[0]
+    assert [e for e, _ in audit.events] == ["exit_cycle_skipped_lock_timeout"]
+
+
+def test_exit_cycle_runs_normally_when_lock_is_free():
+    calls = []
+
+    class Eng:
+        def run_exit_cycle(self, now):
+            calls.append("exit")
+
+    notifier = RecordingNotifier()
+    _, exit_ = cli.build_jobs(Eng(), object(), notifier=notifier, audit=FakeAudit(), lock_timeout=0.1)
+    exit_()
+    assert calls == ["exit"] and notifier.sent == []
+
+
+def test_lock_timeout_is_longer_than_exit_interval():
+    assert cli.exit_lock_timeout(60) > 60
+    assert cli.exit_lock_timeout(600) > 600
+
+
+# --- run no muestra trazas ---
+
+def test_run_validates_signals_csv_at_startup(paper_yaml, tmp_path, root):
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(tmp_path / "nope.csv"),
+                "--root", str(root), "--once"])
+    assert r.exit_code != 0 and "Traceback" not in r.output and "nope.csv" in r.output
+
+
+def test_run_malformed_signals_csv_is_a_message(paper_yaml, tmp_path, root):
+    bad = tmp_path / "bad_signals.csv"
+    bad.write_text("a,b\n1,2\n", encoding="utf-8")
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(bad), "--root", str(root), "--once"])
+    assert r.exit_code != 0 and "Traceback" not in r.output and "bad_signals.csv" in r.output
+
+
+def test_run_unknown_exchange_is_a_message(paper_yaml, signals_csv, root):
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(signals_csv), "--root", str(root),
+                "--once", "--exchange", "noexiste"], CliDeps())
+    assert r.exit_code != 0 and "Traceback" not in r.output and "noexiste" in r.output
