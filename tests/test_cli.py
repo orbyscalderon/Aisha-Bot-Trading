@@ -754,3 +754,52 @@ def test_backtest_truncated_signal_row_is_a_message(paper_yaml, quotes_csv, tmp_
     )
     r = invoke(["backtest", "--config", str(paper_yaml), "--signals", str(bad), "--quotes", str(quotes_csv)])
     assert r.exit_code != 0 and not isinstance(r.exception, AttributeError)
+
+
+# --- los resultados de los ciclos programados llegan al operador ---
+
+def _exit_job(result):
+    class Eng:
+        def run_exit_cycle(self, now):
+            return result
+
+    notifier = RecordingNotifier()
+    _, exit_ = cli.build_jobs(Eng(), object(), notifier=notifier, lock_timeout=0.1)
+    exit_()
+    return notifier
+
+
+def test_scheduled_exit_cycle_with_errors_notifies_once_at_warning_with_the_count():
+    from core.engine import ExitCycleResult
+    n = _exit_job(ExitCycleResult([], ["p1: sin cotización válida para A/USDT",
+                                       "p2: sin cotización válida para B/USDT"]))
+    assert len(n.sent) == 1
+    msg, level = n.sent[0]
+    assert level is Level.WARNING and "2" in msg and "A/USDT" in msg
+
+
+def test_scheduled_clean_exit_cycle_notifies_nothing():
+    from core.engine import ExitCycleResult
+    assert _exit_job(ExitCycleResult()).sent == []
+
+
+def test_summary_does_not_duplicate_errors_the_engine_already_alerted():
+    from core.engine import ExitCycleResult
+    stuck = "p1 (A/USDT): orden atascada, requiere atención manual"
+    assert _exit_job(ExitCycleResult([], [stuck], [stuck])).sent == []
+    n = _exit_job(ExitCycleResult([], [stuck, "p2: sin cotización"], [stuck]))
+    assert len(n.sent) == 1 and "1 error" in n.sent[0][0] and "p1" not in n.sent[0][0]
+
+
+def test_scheduled_entry_cycle_rejections_do_not_notify(caplog):
+    from core.engine import EntryCycleResult
+
+    class Eng:
+        def run_entry_cycle(self, source, now):
+            return EntryCycleResult(rejected=[("s1", "algo")])
+
+    notifier = RecordingNotifier()
+    entry, _ = cli.build_jobs(Eng(), object(), notifier=notifier)
+    with caplog.at_level("DEBUG", logger="cli"):
+        entry()
+    assert notifier.sent == [] and "rechazada" in caplog.text

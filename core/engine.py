@@ -74,6 +74,9 @@ class EntryCycleResult:
 class ExitCycleResult:
     closed: list[Position] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Subconjunto de ``errors`` que el motor ya notificó uno a uno (CRITICAL o WARNING).
+    # Quien resuma el ciclo debe excluirlos para no avisar dos veces de lo mismo.
+    alerted: list[str] = field(default_factory=list)
 
 
 class ExitRefused(Exception):
@@ -369,6 +372,7 @@ class Engine:
     def run_exit_cycle(self, now: datetime) -> ExitCycleResult:
         closed: list[Position] = []
         errors: list[str] = []
+        alerted: list[str] = []
         for position in self._portfolio.open_positions():
             try:
                 quote = self._quote(position.symbol)
@@ -384,17 +388,19 @@ class Engine:
             except ExitRefused as exc:
                 # Ya se avisó con CRITICAL: solo queda constancia en el resultado y la auditoría.
                 errors.append(str(exc))
+                alerted.append(str(exc))
                 self._log("exit_error", now, position_id=position.id, error=str(exc))
                 continue
             except Exception as exc:  # noqa: BLE001 - una posición no aborta a las demás
                 msg = f"{position.id}: {exc!r}"
                 errors.append(msg)
+                alerted.append(msg)
                 self._log("exit_error", now, position_id=position.id, error=msg)
                 self._notify(f"error cerrando {position.symbol}: {exc!r}", Level.WARNING)
                 continue
             if done is not None:
                 closed.append(done)
-        return ExitCycleResult(closed, errors)
+        return ExitCycleResult(closed, errors, alerted)
 
     def _process_exit(self, position: Position, quote: Quote, now: datetime) -> Position | None:
         # La monotonía del pico vive en next_peak_price; el repositorio guarda lo que le den.

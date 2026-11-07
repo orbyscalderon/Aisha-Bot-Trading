@@ -180,6 +180,27 @@ def exit_lock_timeout(exit_interval_seconds: float) -> float:
     return exit_interval_seconds * 2 + 5
 
 
+def _summarise_exit_errors(result: Any, notifier: Notifier | None) -> None:
+    """Un WARNING por ciclo con los errores que el motor NO notificó ya individualmente.
+
+    El motor avisa solo (CRITICAL/WARNING) de las salidas rechazadas o falladas; resumirlas
+    otra vez sería duplicar. Aquí solo quedan las silenciosas (p. ej. sin cotización). Sin
+    nada que decir no se envía nada: una alerta que suena cada minuto acaba silenciada.
+    """
+    errors = list(getattr(result, "errors", None) or ())
+    already = list(getattr(result, "alerted", None) or ())
+    pending = []
+    for e in errors:
+        if e in already:
+            already.remove(e)  # multiconjunto: dos errores iguales no se compensan entre sí
+        else:
+            pending.append(e)
+    if not pending or notifier is None:
+        return
+    shown = "; ".join(pending[:3]) + ("; ..." if len(pending) > 3 else "")
+    notifier.send(f"ciclo de salida con {len(pending)} error(es): {shown}", Level.WARNING)
+
+
 def build_jobs(
     engine: Engine,
     source: Any,
@@ -205,7 +226,11 @@ def build_jobs(
 
     def entry() -> None:
         with lock:
-            engine.run_entry_cycle(source, datetime.now(timezone.utc))
+            result = engine.run_entry_cycle(source, datetime.now(timezone.utc))
+        # Un rechazo es operación normal (una puerta de riesgo haciendo su trabajo): no se
+        # avisa, solo queda en el log para quien active DEBUG.
+        for item in getattr(result, "rejected", None) or ():
+            logger.debug("entrada rechazada: %s", item)
 
     def exit_() -> None:
         if not lock.acquire(timeout=timeout):
@@ -229,9 +254,10 @@ def build_jobs(
                     logger.error("no se pudo auditar el ciclo de salida omitido: %s", type(exc).__name__)
             return
         try:
-            engine.run_exit_cycle(datetime.now(timezone.utc))
+            result = engine.run_exit_cycle(datetime.now(timezone.utc))
         finally:
             lock.release()
+        _summarise_exit_errors(result, notifier)
 
     return entry, exit_
 
