@@ -646,3 +646,14 @@ def test_fill_in_last_microsecond_of_utc_day_counts_for_that_day(make_env):
                             Decimal("1"), Decimal(0), last))
     assert p.spent_usd(date(2026, 3, 1)) == Decimal("100")
     assert p.spent_usd(date(2026, 3, 2)) == Decimal(0)
+
+
+def test_engine_notifications_carry_no_mode_prefix_of_their_own(make_env):
+    # Los notificadores ya anteponen "mode: ..."; el motor no debe duplicarlo.
+    env = make_env()
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    Path_ = __import__("pathlib").Path
+    (Path_(env.root) / "STOP").write_text("x", encoding="utf-8")
+    env.engine.run_entry_cycle(FakeSource([sig("s2")]), NOW)
+    assert env.notifier.sent
+    assert not any(m.startswith("mode:") for m, _ in env.notifier.sent)

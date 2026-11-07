@@ -325,3 +325,12 @@ def test_get_balance_unreadable_ticker_response_still_raises(ticker):
     client = FakeCcxt(balance=balance, markets={"BTC/USDT": {}}, tickers={"BTC/USDT": ticker})
     with pytest.raises(QuoteUnavailable):
         source(client).get_balance()
+
+
+def test_unreadable_ticker_message_truncates_the_payload():
+    # El mensaje llega a logs y a la CLI: un payload de exchange entero no debe volcarse.
+    payload = ["SECRETO" * 20] * 50
+    with pytest.raises(QuoteUnavailable) as exc:
+        source(FakeCcxt(payload)).get_quote("X/USDT")
+    text = str(exc.value)
+    assert "list" in text and len(text) < 300

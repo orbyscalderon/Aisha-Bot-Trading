@@ -123,7 +123,11 @@ class CexDataSource(MarketDataSource):
         ticker = self._call(self._client.fetch_ticker, symbol)
         if not isinstance(ticker, dict):
             # Respuesta ilegible (no es "este mercado no tiene precio"): transitoria.
-            raise QuoteUnavailable(f"respuesta de ticker ilegible para {symbol}: {ticker!r}")
+            # Recortado: el mensaje llega a logs y a la CLI, y el payload del exchange puede ser enorme.
+            raise QuoteUnavailable(
+                f"respuesta de ticker ilegible para {symbol}: "
+                f"{type(ticker).__name__} {repr(ticker)[:120]}"
+            )
         raw = ticker.get("last")
         if raw is None:
             raise _NoPrice(f"sin precio para {symbol}")

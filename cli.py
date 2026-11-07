@@ -160,7 +160,11 @@ def _build(
 
 def build_engine(config: BotConfig, root: Path, **kwargs: Any) -> Engine:
     """Compone el motor con sus dependencias concretas. Único sitio que lo hace."""
-    return _build(config, root, **kwargs)[0]
+    engine, _notifier, side_audit = _build(config, root, **kwargs)
+    # Solo ``run`` cablea la auditoría del cerrojo en ``build_jobs``; aquí se descartaría
+    # con su conexión abierta.
+    side_audit.close()
+    return engine
 
 
 def default_scheduler() -> BlockingScheduler:
@@ -478,6 +482,17 @@ def _open_positions(cfg: BotConfig, root: Path) -> list:
         conn.close()
 
 
+def _unconfirmed_intents(cfg: BotConfig, root: Path) -> list:
+    db = _db_path(cfg, root)
+    if not db.exists():
+        return []
+    conn = init_db(db)
+    try:
+        return Repository(conn).unconfirmed_intents()
+    finally:
+        conn.close()
+
+
 @app.command()
 def status(config: Path = ConfigOpt, root: Path = RootOpt) -> None:
     """Modo, kill switch y posiciones abiertas."""
@@ -485,6 +500,19 @@ def status(config: Path = ConfigOpt, root: Path = RootOpt) -> None:
     _say(cfg, "estado")
     typer.echo(f"kill switch: {'ACTIVO' if is_kill_switch_active(Path(root)) else 'inactivo'}")
     typer.echo(f"posiciones abiertas: {len(_open_positions(cfg, root))}")
+    pending = _unconfirmed_intents(cfg, root)
+    typer.echo(f"órdenes sin confirmar: {len(pending)}")
+    for intent in pending:
+        typer.echo(
+            f"  {intent.client_order_id}  {intent.status.value}  "
+            f"{intent.payload.get('position_id') or intent.payload.get('symbol', '?')}  "
+            f"{intent.created_at.isoformat()}"
+        )
+    if pending:
+        typer.echo(
+            "  (una orden en SENT es de resultado incierto: si es una salida, esa posición "
+            "no se cerrará sola; comprueba el exchange y reconcilia)"
+        )
 
 
 @app.command()

@@ -362,6 +362,44 @@ def test_status_shows_kill_switch_active(paper_yaml, root):
     assert "kill switch: ACTIVO" in out
 
 
+def test_status_lists_unconfirmed_intents(paper_yaml, root):
+    # Una orden en SENT (resultado incierto) es lo que bloquea una salida: el operador
+    # debe verla aquí, no enterarse por un log.
+    from datetime import datetime, timezone
+    from storage.db import init_db
+    from storage.repository import Repository
+    cfg = load_config(paper_yaml)
+    conn = init_db(root / f"{cfg.mode.value}.db")
+    repo = Repository(conn)
+    repo.reserve_intent("exit-abc", {"position_id": "p1", "reason": "stop_loss"},
+                        datetime(2026, 1, 1, tzinfo=timezone.utc))
+    repo.mark_intent_sent("exit-abc")
+    conn.close()
+    out = invoke(["status", "--config", str(paper_yaml), "--root", str(root)]).output
+    assert "órdenes sin confirmar: 1" in out
+    assert "exit-abc" in out and "sent" in out.lower() and "p1" in out
+
+
+def test_status_reports_zero_unconfirmed_intents(paper_yaml, root):
+    out = invoke(["status", "--config", str(paper_yaml), "--root", str(root)]).output
+    assert "órdenes sin confirmar: 0" in out
+
+
+def test_build_engine_closes_the_side_audit_connection_it_drops(paper_yaml, root, monkeypatch):
+    closed = []
+    real = cli._build
+
+    def spy(*a, **kw):
+        engine, notifier, audit = real(*a, **kw)
+        orig = audit.close
+        audit.close = lambda: (closed.append(True), orig())[1]
+        return engine, notifier, audit
+
+    monkeypatch.setattr(cli, "_build", spy)
+    build_engine(load_config(paper_yaml), root, data_source=FakeData())
+    assert closed == [True]
+
+
 def test_positions_lists_open_positions(paper_yaml, root):
     from core.models import Market, Position
     from storage.db import init_db

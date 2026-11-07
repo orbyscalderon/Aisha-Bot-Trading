@@ -25,6 +25,10 @@ class AuditLog:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    def close(self) -> None:
+        """Cierra la conexión (para quien creó un AuditLog con conexión propia)."""
+        self._conn.close()
+
     def record(self, event: str, payload: dict, now: datetime | None = None) -> int:
         """Añade un evento y devuelve el id de la fila."""
         ts = _ts(now if now is not None else datetime.now(timezone.utc))
