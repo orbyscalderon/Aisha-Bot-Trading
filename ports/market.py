@@ -17,6 +17,16 @@ class QuoteUnavailable(Exception):
     """No hay cotización utilizable para el símbolo."""
 
 
+class MarketUnpriceable(QuoteUnavailable):
+    """Imposibilidad PERMANENTE de valorar este símbolo (no existe mercado, o no tiene precio).
+
+    Se distingue de un QuoteUnavailable a secas, que es un fallo TRANSITORIO (red, límite de
+    tasa, respuesta ilegible). Quien calcula un agregado (el capital total) puede omitir un
+    MarketUnpriceable; un QuoteUnavailable a secas debe propagarse, o se dimensionaría contra
+    una cifra equivocada.
+    """
+
+
 class OrderRejected(Exception):
     """Rechazo DEFINITIVO: el mercado dijo que no, la orden no se ejecutó.
 

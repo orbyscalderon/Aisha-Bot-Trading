@@ -147,6 +147,17 @@ def test_quote_in_the_future_is_unavailable_never_leaked():
         src.get_quote("ETH/USDT")
 
 
+def test_symbol_without_any_quote_is_unpriceable_but_a_future_quote_is_transient():
+    from ports.market import MarketUnpriceable
+    src = HistoricalSource([], quotes_from(100, 110))
+    src.set_time(T0 - timedelta(minutes=1))
+    with pytest.raises(MarketUnpriceable):
+        src.get_quote("ETH/USDT")  # ninguna cotización en todo el dataset: permanente
+    with pytest.raises(QuoteUnavailable) as info:
+        src.get_quote("BTC/USDT")  # existe, solo que aún no: no es permanente
+    assert not isinstance(info.value, MarketUnpriceable)
+
+
 def test_using_the_source_before_setting_the_clock_fails():
     with pytest.raises(RuntimeError):
         HistoricalSource([], quotes_from(100)).get_quote("BTC/USDT")
