@@ -423,17 +423,27 @@ class Engine:
         ):
             self._log("exit_duplicate", now, position_id=position.id, client_order_id=coid)
             intent = self._repo.get_intent(coid)
-            if intent is not None and intent.status is IntentStatus.SENT:
-                # En una compra, SENT bloqueando el reintento evita un doble gasto. En una
-                # SALIDA te deja dentro de la posición: el id no lleva reloj, así que ese
-                # intent no se libera solo y el stop-loss queda inutilizado. Hay que insistir
-                # en cada ciclo hasta que una persona lo resuelva.
+            if intent is not None and intent.status in (IntentStatus.SENT, IntentStatus.RESERVED):
+                # En una compra, bloquear el reintento evita un doble gasto. En una SALIDA te
+                # deja dentro de la posición: el id no lleva reloj, así que ese intent no se
+                # libera solo y el stop-loss queda inutilizado. Hay que insistir en cada ciclo
+                # hasta que una persona lo resuelva. RESERVED visto aquí nunca es normal: en
+                # un ciclo cada posición se procesa una vez, así que un ciclo anterior murió
+                # entre reservar y marcar SENT. Las demás (CONFIRMED) son una salida ya hecha.
+                if intent.status is IntentStatus.SENT:
+                    estado = (
+                        "quedó en estado incierto (SENT): puede haber llegado o no al mercado. "
+                        "Comprueba en el exchange si la venta se ejecutó y reconcilia la orden "
+                    )
+                else:
+                    estado = (
+                        "quedó RESERVED: el proceso murió antes de enviarla, así que NO salió "
+                        "al mercado. Libera o elimina el intent para que se reintente "
+                    )
                 msg = (
                     f"{position.id} ({position.symbol}): la orden de salida "
-                    f"{decision.reason.value} quedó en estado incierto (SENT) y la posición "
-                    "NO se puede cerrar automáticamente. Requiere atención manual: comprueba "
-                    "en el exchange si la venta se ejecutó y reconcilia la orden "
-                    f"{coid}."
+                    f"{decision.reason.value} {estado}{coid}; mientras tanto la posición "
+                    "NO se puede cerrar automáticamente. Requiere atención manual."
                 )
                 self._notify(msg, Level.CRITICAL)
                 raise ExitRefused(msg)
