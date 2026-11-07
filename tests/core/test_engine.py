@@ -693,3 +693,18 @@ def test_engine_notifications_carry_no_mode_prefix_of_their_own(make_env):
     env.engine.run_entry_cycle(FakeSource([sig("s2")]), NOW)
     assert env.notifier.sent
     assert not any(m.startswith("mode:") for m, _ in env.notifier.sent)
+
+
+def test_scheduled_stuck_reserved_exit_gives_one_critical_and_no_duplicate_summary(make_env):
+    # Los dos lados juntos: el motor real + el trabajo programado real. El resumen de la
+    # CLI no debe repetir lo que el motor ya avisó como CRITICAL.
+    import cli
+    from core.idempotency import exit_order_id
+    env = make_env()
+    p = open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    env.repo.reserve_intent(exit_order_id(p.id, Side.SELL, ExitReason.STOP_LOSS), {}, NOW)
+    _, exit_ = cli.build_jobs(env.engine, FakeSource([]), notifier=env.notifier)
+    env.notifier.sent.clear()
+    exit_()
+    assert [lvl for _, lvl in env.notifier.sent] == [Level.CRITICAL]

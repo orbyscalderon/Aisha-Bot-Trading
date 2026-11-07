@@ -180,12 +180,20 @@ def exit_lock_timeout(exit_interval_seconds: float) -> float:
     return exit_interval_seconds * 2 + 5
 
 
-def _summarise_exit_errors(result: Any, notifier: Notifier | None) -> None:
+def _summarise_exit_errors(
+    result: Any, notifier: Notifier | None, previous: set[str]
+) -> None:
     """Un WARNING por ciclo con los errores que el motor NO notificó ya individualmente.
 
     El motor avisa solo (CRITICAL/WARNING) de las salidas rechazadas o falladas; resumirlas
     otra vez sería duplicar. Aquí solo quedan las silenciosas (p. ej. sin cotización). Sin
     nada que decir no se envía nada: una alerta que suena cada minuto acaba silenciada.
+
+    Deduplicación: ``previous`` guarda los errores del ciclo anterior y solo se avisa de los
+    NUEVOS (el mensaje lleva posición y símbolo, así que la clave es por posición). Un error
+    que desaparece sale del conjunto, de modo que si vuelve se avisa otra vez. Se prefiere a
+    un intervalo mínimo porque no hay reloj que afinar y avisa exactamente cuando la causa
+    cambia, que es lo que el operador necesita saber.
     """
     errors = list(getattr(result, "errors", None) or ())
     already = list(getattr(result, "alerted", None) or ())
@@ -195,10 +203,13 @@ def _summarise_exit_errors(result: Any, notifier: Notifier | None) -> None:
             already.remove(e)  # multiconjunto: dos errores iguales no se compensan entre sí
         else:
             pending.append(e)
-    if not pending or notifier is None:
+    new = [e for e in pending if e not in previous]
+    previous.clear()
+    previous.update(pending)
+    if not new or notifier is None:
         return
-    shown = "; ".join(pending[:3]) + ("; ..." if len(pending) > 3 else "")
-    notifier.send(f"ciclo de salida con {len(pending)} error(es): {shown}", Level.WARNING)
+    shown = "; ".join(new[:3]) + ("; ..." if len(new) > 3 else "")
+    notifier.send(f"ciclo de salida con {len(new)} error(es) nuevo(s): {shown}", Level.WARNING)
 
 
 def build_jobs(
@@ -222,6 +233,7 @@ def build_jobs(
     misma base es otro problema): se avisa con nivel CRITICAL y se audita.
     """
     lock = threading.Lock()
+    reported: set[str] = set()  # errores silenciosos ya avisados en el ciclo anterior
     timeout = exit_lock_timeout(60) if lock_timeout is None else lock_timeout
 
     def entry() -> None:
@@ -257,7 +269,7 @@ def build_jobs(
             result = engine.run_exit_cycle(datetime.now(timezone.utc))
         finally:
             lock.release()
-        _summarise_exit_errors(result, notifier)
+        _summarise_exit_errors(result, notifier, reported)
 
     return entry, exit_
 

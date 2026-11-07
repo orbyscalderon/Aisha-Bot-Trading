@@ -803,3 +803,46 @@ def test_scheduled_entry_cycle_rejections_do_not_notify(caplog):
     with caplog.at_level("DEBUG", logger="cli"):
         entry()
     assert notifier.sent == [] and "rechazada" in caplog.text
+
+
+# --- deduplicación: avisar una vez de cada cosa, no callar ---
+
+def _scripted_exit_job(results):
+    it = iter(results)
+
+    class Eng:
+        def run_exit_cycle(self, now):
+            return next(it)
+
+    notifier = RecordingNotifier()
+    _, exit_ = cli.build_jobs(Eng(), object(), notifier=notifier, lock_timeout=0.1)
+    return exit_, notifier
+
+
+def test_same_silent_error_is_reported_once_not_every_cycle():
+    from core.engine import ExitCycleResult
+    e = "p1: sin cotización válida para DEAD/USDT"
+    exit_, n = _scripted_exit_job([ExitCycleResult([], [e])] * 5)
+    for _ in range(5):
+        exit_()
+    assert len(n.sent) == 1 and "DEAD/USDT" in n.sent[0][0]  # la primera vez SÍ sale
+
+
+def test_a_new_or_different_error_is_always_reported():
+    from core.engine import ExitCycleResult
+    a, b = "p1: sin cotización válida para A/USDT", "p2: sin cotización válida para B/USDT"
+    exit_, n = _scripted_exit_job([ExitCycleResult([], [a]), ExitCycleResult([], [a, b])])
+    exit_(); exit_()
+    assert len(n.sent) == 2
+    assert "B/USDT" in n.sent[1][0] and "A/USDT" not in n.sent[1][0] and "1 error" in n.sent[1][0]
+
+
+def test_an_error_that_resolves_and_comes_back_is_reported_again():
+    from core.engine import ExitCycleResult
+    e = "p1: sin cotización válida para A/USDT"
+    exit_, n = _scripted_exit_job(
+        [ExitCycleResult([], [e]), ExitCycleResult(), ExitCycleResult([], [e])]
+    )
+    for _ in range(3):
+        exit_()
+    assert len(n.sent) == 2
