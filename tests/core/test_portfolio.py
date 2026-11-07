@@ -138,3 +138,34 @@ def test_realized_pnl_buy_and_sell_with_all_fees(repo):
     repo.save_fill(fill(datetime(2026, 11, 4, 10, 0, tzinfo=UTC), Side.SELL, 60, 2, "p1", fee=1))
     assert Portfolio(repo).realized_pnl_usd(D) == Decimal("-81")
     assert Portfolio(repo).spent_usd(D) == Decimal("200")
+
+
+# --- patrimonio total: única implementación (la usan el modo simulado y el backtest) ---
+
+def test_total_equity_is_initial_plus_cash_flow_plus_mark_to_market(repo):
+    from ports.market import QuoteUnavailable  # noqa: F401
+    p1 = pos(amount=200, entry=100, qty="2")
+    repo_with(repo, p1)
+    repo.save_fill(fill(datetime(2026, 11, 4, 9, 0, tzinfo=UTC), Side.BUY, 100, 2, fee="1"))
+    equity = Portfolio(repo).total_equity_usd(lambda s: q(120, s), Decimal(1000))
+    # 1000 - 200 (compra) - 1 (comisión) + 2 x 120 (valor a mercado)
+    assert equity == Decimal(1039)
+
+
+def test_total_equity_skips_unquotable_position_with_a_warning(repo, caplog):
+    # Política única: una posición sin cotización NO congela el capital (y con él todas las
+    # entradas); se omite su valoración y se avisa. Igual que el adaptador de CEX.
+    from ports.market import QuoteUnavailable
+    ok = pos("BTC/USDT", amount=200, entry=100, qty="2")
+    gone = pos("DEAD/USDT", amount=100, entry=10, qty="10")
+    repo_with(repo, ok, gone)
+
+    def quote(symbol):
+        if symbol == "DEAD/USDT":
+            raise QuoteUnavailable(symbol)
+        return q(120, symbol)
+
+    with caplog.at_level("WARNING"):
+        equity = Portfolio(repo).total_equity_usd(quote, Decimal(1000))
+    assert equity == Decimal(1240)  # 1000 + 2 x 120; DEAD fuera
+    assert "DEAD/USDT" in caplog.text

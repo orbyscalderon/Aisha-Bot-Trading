@@ -40,7 +40,7 @@ from adapters.paper.executor import PaperExecutor
 from backtest.runner import run_backtest
 from core.config import BotConfig, ConfigError, ProtectionsConfig, load_config
 from core.engine import Engine
-from core.models import Market, Mode, Quote, Side
+from core.models import Market, Mode, Quote
 from core.portfolio import Portfolio
 from core.safety import KILL_SWITCH_FILENAME, CircuitBreaker, is_kill_switch_active, mode_prefix
 from ports.market import MarketDataSource
@@ -99,17 +99,7 @@ class PaperCapitalSource(MarketDataSource):
         return self._inner.get_quote(symbol)
 
     def get_balance(self) -> Decimal:
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        forever = datetime(2200, 1, 1, tzinfo=timezone.utc)
-        cash = self._capital
-        for f in self._repo.fills_between(epoch, forever):
-            notional = f.price * f.quantity
-            cash += (-notional if f.side is Side.BUY else notional) - f.fee_usd
-        held = sum(
-            (p.quantity * self._inner.get_quote(p.symbol).price for p in self._repo.open_positions()),
-            Decimal(0),
-        )
-        return cash + held
+        return Portfolio(self._repo).total_equity_usd(self._inner.get_quote, self._capital)
 
 
 def _make_notifier(mode: Mode) -> Notifier:

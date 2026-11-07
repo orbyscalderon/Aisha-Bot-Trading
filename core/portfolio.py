@@ -10,14 +10,20 @@ Todo importe es ``Decimal``.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from core.models import Fill, Position, Quote, Side
+from ports.market import QuoteUnavailable
 from storage.repository import Repository
 
 _ZERO = Decimal(0)
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_FOREVER = datetime(2200, 1, 1, tzinfo=timezone.utc)
+
+logger = logging.getLogger(__name__)
 
 
 def _day_window(day: date) -> tuple[datetime, datetime]:
@@ -63,6 +69,30 @@ class Portfolio:
                 continue
             total += p.unrealized_pnl_usd(quote.price)
         return total
+
+    def total_equity_usd(self, quote_fn: Callable[[str], Quote], initial: Decimal) -> Decimal:
+        """Capital simulado: inicial + efectivo de todos los fills + valor a mercado de lo abierto.
+
+        Única implementación (modo simulado y backtest la comparten: si cada uno tuviera la
+        suya, divergirían). Política de una posición sin cotización: se OMITE su valoración
+        con un WARNING, no se falla. Fallar congelaría TODAS las entradas, de cualquier
+        símbolo, mientras dure un solo activo deslistado; omitirla solo subestima el capital
+        (el lado conservador: tamaños menores) y es lo que ya hace el adaptador de CEX.
+        """
+        cash = initial
+        for f in self._repo.fills_between(_EPOCH, _FOREVER):
+            notional = f.price * f.quantity
+            cash += (-notional if f.side is Side.BUY else notional) - f.fee_usd
+        held = _ZERO
+        for p in self._repo.open_positions():
+            try:
+                held += p.quantity * quote_fn(p.symbol).price
+            except QuoteUnavailable as exc:
+                logger.warning(
+                    "capital: sin cotización para %s (posición %s); se omite su valoración (%s)",
+                    p.symbol, p.id, exc,
+                )
+        return cash + held
 
     # --- agregados del día (ventana UTC semiabierta) ---
 

@@ -46,7 +46,7 @@ from backtest.metrics import (
 )
 from core.config import BotConfig
 from core.engine import Engine
-from core.models import Fill, Market, Position, Quote, Side, Signal
+from core.models import Fill, Market, Position, Quote, Signal
 from core.portfolio import Portfolio
 from core.safety import CircuitBreaker
 from ports.market import MarketDataSource, QuoteUnavailable
@@ -119,15 +119,7 @@ class HistoricalSource(SignalSource, MarketDataSource):
     def get_balance(self) -> Decimal:
         if self._repo is None:
             return self._balance
-        cash = self._balance
-        for f in self._repo.fills_between(_EPOCH, _FOREVER):
-            notional = f.price * f.quantity
-            cash += (-notional if f.side is Side.BUY else notional) - f.fee_usd
-        held = sum(
-            (p.quantity * self.get_quote(p.symbol).price for p in self._repo.open_positions()),
-            Decimal(0),
-        )
-        return cash + held
+        return Portfolio(self._repo).total_equity_usd(self.get_quote, self._balance)
 
 
 class _SilentNotifier(Notifier):

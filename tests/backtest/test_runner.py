@@ -235,24 +235,51 @@ def test_report_shows_open_positions(tmp_path):
     assert "Posiciones abiertas al final: 1" in text
 
 
-def test_balance_raises_when_an_open_position_has_no_quote():
-    # decisión, no accidente: igual que el adaptador real, un hueco en los datos
-    # no se valora en silencio (el motor registra el error del ciclo y sigue).
+def test_balance_skips_an_open_position_without_quote_instead_of_raising(caplog):
+    # I3: una posición sin cotización ya no congela todas las entradas (política única en
+    # Portfolio.total_equity_usd, la misma del adaptador de CEX): se omite y se avisa.
     from core.models import Position
     from storage.db import init_db
     from storage.repository import Repository
 
-    src = HistoricalSource([], quotes_from(100))
+    src = HistoricalSource([], quotes_from(100), Decimal(1000))
     src.set_time(T0)
     conn = init_db(":memory:")
     repo = Repository(conn)
     src.bind_repository(repo)
     repo.save_position(Position("p1", "s", "t1", Market.CEX, "ETH/USDT", Decimal("1"), Decimal("1"),
                                 Decimal("1"), T0, Decimal("1")))
-    with pytest.raises(QuoteUnavailable):
-        src.get_balance()
+    with caplog.at_level("WARNING"):
+        assert src.get_balance() == Decimal(1000)
+    assert "ETH/USDT" in caplog.text
     conn.close()
 
+
+def test_backtest_and_paper_feed_the_engine_the_same_equity():
+    # La propiedad que el backtest necesita para ser fiel: la MISMA cantidad llega al motor.
+    # (``engine_class is Engine`` no puede detectar una divergencia aquí.)
+    from cli import PaperCapitalSource
+    from core.models import Fill, Position
+    from storage.db import init_db
+    from storage.repository import Repository
+
+    hist = HistoricalSource([], quotes_from(100, symbol="BTC/USDT") + quotes_from(7, symbol="DEAD/USDT"),
+                            Decimal(1000))
+    hist.set_time(T0)
+    conn = init_db(":memory:")
+    repo = Repository(conn)
+    hist.bind_repository(repo)
+    paper = PaperCapitalSource(hist, repo, Decimal(1000))
+    repo.save_position(Position("p1", "s1", "t1", Market.CEX, "BTC/USDT", Decimal(90), Decimal(2),
+                                Decimal(180), T0, Decimal(90)))
+    repo.save_fill(Fill("f1", "c1", Market.CEX, "BTC/USDT", Side.BUY, Decimal(90), Decimal(2),
+                        Decimal("0.5"), T0))
+    assert hist.get_balance() == paper.get_balance() == Decimal("1019.5")
+    # y con un activo sin cotización ambos hacen exactamente lo mismo
+    repo.save_position(Position("p2", "s2", "t1", Market.CEX, "GONE/USDT", Decimal(1), Decimal(1),
+                                Decimal(1), T0, Decimal(1)))
+    assert hist.get_balance() == paper.get_balance() == Decimal("1019.5")
+    conn.close()
 
 
 def test_backtest_with_explicit_offsets_matches_the_utc_equivalent():
