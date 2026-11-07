@@ -100,7 +100,7 @@ git commit -m "feat(core): añadir modelos del dominio"
 
 **Interfaces:**
 - Consumes: enums de Tarea 1.
-- Produces: `load_config(yaml_path: Path) -> BotConfig`. `BotConfig` con atributos `mode`, `sizing: SizingConfig`, `exits: ExitsConfig`, `risk: RiskConfig`, `cadence: CadenceConfig`, `allowlist: list[str]`, `markets: dict`. `BotConfig.fingerprint() -> str` (sha256 del contenido normalizado, para el periodo de sombra del plan 3). Excepción `ConfigError`.
+- Produces: `load_config(yaml_path: Path) -> BotConfig`. `BotConfig` con atributos `mode`, `sizing: SizingConfig`, `exits: ExitsConfig`, `risk: RiskConfig`, `cadence: CadenceConfig`, `execution: dict[Market, ExecutionConfig]`, `allowlist: list[str]`. `ExecutionConfig` con `slippage_bps: int`, `fee_bps: int`, `quantity_precision: int`. `BotConfig.fingerprint() -> str` (sha256 del contenido normalizado, para el periodo de sombra del plan 3). Excepción `ConfigError`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -130,6 +130,31 @@ def test_fingerprint_stable_across_key_order():
 
 def test_fingerprint_changes_with_threshold():
     assert load_config(a).fingerprint() != load_config(a_with_other_stop_loss).fingerprint()
+
+def test_execution_defaults_per_market():
+    # spec §6.2: el deslizamiento por defecto es mayor en Solana que en CEX
+    ex = load_config(minimal_yaml).execution
+    assert ex[Market.CEX].slippage_bps == 10 and ex[Market.CEX].fee_bps == 10
+    assert ex[Market.SOLANA].slippage_bps == 100 and ex[Market.SOLANA].fee_bps == 25
+    assert ex[Market.STOCKS].slippage_bps == 5 and ex[Market.STOCKS].fee_bps == 0
+    assert ex[Market.FOMO].slippage_bps == 100 and ex[Market.FOMO].fee_bps == 25
+
+def test_quantity_precision_defaults_per_market():
+    ex = load_config(minimal_yaml).execution
+    assert (ex[Market.CEX].quantity_precision, ex[Market.SOLANA].quantity_precision) == (8, 6)
+    assert (ex[Market.STOCKS].quantity_precision, ex[Market.FOMO].quantity_precision) == (4, 6)
+
+def test_execution_values_overridable_from_yaml():
+    assert load_config(yaml_with_cex_slippage(42)).execution[Market.CEX].slippage_bps == 42
+
+def test_example_config_loads_with_conservative_defaults():
+    c = load_config(Path("config/config.example.yaml"))
+    assert c.mode is Mode.PAPER
+    assert c.sizing.flat_amount_usd == Decimal("25")
+    assert c.exits.stop_loss_pct == Decimal("15") and c.exits.trailing is False
+    assert (c.risk.max_open_positions, c.risk.max_usd_per_token) == (5, Decimal("50"))
+    assert c.risk.max_daily_loss_usd == Decimal("50")
+    assert c.risk.hard_max_order_usd == Decimal("50")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -141,7 +166,26 @@ Expected: FAIL con `ModuleNotFoundError`
 
 Un validador de modelo en `BotConfig` aplica las reglas cruzadas: `stop_loss_pct` obligatorio si `mode == LIVE`; `mirror_pct` y `mirror_cap_usd` obligatorios si `sizing.strategy == "mirror"`; `exits.primary` obligatorio y uno de `copy_sell|take_profit|time_stop`; `take_profit_pct` obligatorio si `primary == "take_profit"`; `time_stop_hours` obligatorio si `primary == "time_stop"`; todos los límites de `risk` positivos. Los errores de `pydantic` se envuelven en `ConfigError` conservando el mensaje. `fingerprint()` serializa con `json.dumps(..., sort_keys=True, default=str)` y devuelve el sha256 hexadecimal.
 
-`config/config.example.yaml` lleva los valores por defecto del spec §4.3 y §4.5. `config/.env.example` documenta las claves del spec §7.5, con el comentario de que las de exchange deben crearse **sin permiso de retirada**.
+`execution` se rellena por mercado con los valores por defecto de los tests cuando el YAML no los da, y el YAML puede sobrescribir cualquiera. Los valores viven en configuración y no en el código porque el spec §6.2 exige que el deslizamiento sea ajustable y más alto donde hay menos liquidez.
+
+`config/config.example.yaml` lleva **exactamente** estos valores, elegidos para limitar la pérdida máxima antes que para maximizar la ganancia:
+
+```yaml
+mode: paper
+sizing:   { strategy: flat, flat_amount_usd: 25 }
+exits:    { stop_loss_pct: 15, primary: copy_sell, time_stop_hours: 72, trailing: false }
+risk:
+  max_usd_per_token:   50
+  max_open_positions:  5
+  max_usd_per_day:     150
+  max_daily_loss_usd:  50
+  hard_max_order_usd:  50
+cadence:  { entry_cron: "0 * * * *", exit_interval_seconds: 60 }
+```
+
+La aritmética que justifica estos números: 5 posiciones × 50 USD de tope por token = 250 USD de exposición máxima simultánea, y el bot se apaga solo al perder 50 en un día. La salida primaria es `copy_sell` porque copiar la salida del trader es lo que significa copy-trading; el stop-loss al 15 % y el time-stop de 72 h son redes de seguridad por debajo, no la estrategia. El trailing va desactivado porque persigue máximos y en activos ruidosos cierra antes de tiempo.
+
+Un test comprueba que el fichero de ejemplo carga sin errores y produce estos valores. `config/.env.example` documenta las claves del spec §7.5, con el comentario de que las de exchange deben crearse **sin permiso de retirada**.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -195,6 +239,18 @@ def test_freeze_allowlist_is_write_once_per_session():
     repo.freeze_allowlist("s1", {"t1"})
     with pytest.raises(ValueError):
         repo.freeze_allowlist("s1", {"t1", "t2"})
+
+def test_order_intents_rejects_duplicate_primary_key():
+    conn.execute("INSERT INTO order_intents VALUES ('ct-a','RESERVED','{}','2026-11-04',NULL)")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO order_intents VALUES ('ct-a','RESERVED','{}','2026-11-04',NULL)")
+
+def test_audit_log_rejects_update_and_delete():
+    conn.execute("INSERT INTO audit_log (timestamp,event,payload) VALUES ('t','e','{}')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE audit_log SET event='x'")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM audit_log")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -204,7 +260,13 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement el esquema y el repositorio**
 
-Tablas: `positions`, `fills`, `cursors`, `frozen_allowlist`, y `order_intents` y `audit_log` (sus columnas las definen las Tareas 8 y 9; créalas aquí para tener un único punto de esquema). `PRAGMA journal_mode=WAL` y `foreign_keys=ON`.
+**Esta tarea es dueña del esquema completo. Ninguna tarea posterior ejecuta DDL.** Seis tablas:
+
+- `positions`, `fills`, `cursors`, `frozen_allowlist`
+- `order_intents`: `client_order_id TEXT PRIMARY KEY`, `status TEXT`, `payload TEXT`, `created_at TEXT`, `error TEXT NULL`. La PRIMARY KEY no es decorativa: la Tarea 8 se apoya en ella para la idempotencia.
+- `audit_log`: `id INTEGER PRIMARY KEY AUTOINCREMENT`, `timestamp TEXT`, `event TEXT`, `payload TEXT`, más dos triggers `BEFORE UPDATE` y `BEFORE DELETE` que llaman a `RAISE(ABORT, ...)`.
+
+`PRAGMA journal_mode=WAL` y `foreign_keys=ON`.
 
 Los `Decimal` se guardan como `TEXT` y se reconstruyen con `Decimal(str)`; registra adaptadores con `sqlite3.register_adapter`/`register_converter`. Guardarlos como `REAL` perdería precisión, que es justo lo que el spec §2 prohíbe. Las marcas temporales se guardan en ISO-8601 UTC y se devuelven siempre con `tzinfo=timezone.utc`.
 
@@ -226,11 +288,13 @@ git commit -m "feat(storage): añadir esquema SQLite y repositorio"
 
 **Files:**
 - Create: `core/rules/sizing.py`
-- Test: `tests/core/rules/test_sizing.py`
+- Modify: `core/config.py` (añadir la estrategia `risk` y su regla cruzada)
+- Test: `tests/core/rules/test_sizing.py`, `tests/core/test_config.py`
 
 **Interfaces:**
 - Consumes: `Signal` (Tarea 1), `SizingConfig` (Tarea 2).
-- Produces: `calculate_size(signal: Signal, cfg: SizingConfig) -> SizeResult`. `SizeResult` congelada con `amount_usd: Decimal` y `used_fallback: bool`. `apply_hard_cap(amount_usd: Decimal, hard_max_usd: Decimal) -> Decimal`.
+- Produces: `calculate_size(signal: Signal, cfg: SizingConfig, ctx: SizingContext) -> SizeResult`. `SizingContext` congelada con `equity_usd: Decimal`, `stop_loss_pct: Decimal | None`, `slippage_bps: int`, `fee_bps: int`. `SizeResult` congelada con `amount_usd: Decimal` y `used_fallback: bool`. `apply_hard_cap(amount_usd: Decimal, hard_max_usd: Decimal) -> Decimal`.
+- **Esta tarea añade también la tercera estrategia de tamaño a `core/config.py`**: `SizingConfig.strategy` acepta `risk`, con el campo `risk_pct: Decimal | None`. Regla cruzada nueva: `strategy == "risk"` exige `risk_pct` en (0, 100] **y** exige que `exits.stop_loss_pct` esté configurado. La Tarea 2 está cerrada; esta estrategia entra entera aquí, configuración incluida, para que una sola tarea sea dueña de una sola funcionalidad.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -262,6 +326,59 @@ def test_hard_cap_cuts_absurd_amount():
 
 def test_hard_cap_leaves_amount_below_limit():
     assert apply_hard_cap(Decimal("50"), Decimal("500")) == Decimal("50")
+
+# --- estrategia `risk` (spec §4.3.1) ---
+
+def test_risk_sizes_so_stop_loses_the_declared_fraction():
+    # capital 1000, riesgo 1% -> 10 USD en juego
+    # fracción estresada = 0.15 + 2*10/10000 + 2*10/10000 = 0.154
+    # importe = 10 / 0.154 = 64.93 (ROUND_DOWN a 2 decimales)
+    ctx = SizingContext(equity_usd=Decimal("1000"), stop_loss_pct=Decimal("15"),
+                        slippage_bps=10, fee_bps=10)
+    assert calculate_size(sig, risk_cfg(pct=1), ctx).amount_usd == Decimal("64.93")
+
+def test_risk_scales_with_equity():
+    # El doble de capital da el doble de importe, salvo un céntimo de redondeo:
+    # ROUND_DOWN no se reparte sobre la multiplicación (64.93*2 = 129.86, pero 20/0.154 = 129.87).
+    big = calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("2000"))).amount_usd
+    small = calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("1000"))).amount_usd
+    assert abs(big - small * 2) <= Decimal("0.01")
+
+def test_risk_scales_exactly_when_division_is_clean():
+    # stop 20%, sin deslizamiento ni comisiones -> fracción 0.2, divide exacto
+    ctx = lambda e: SizingContext(equity_usd=e, stop_loss_pct=Decimal("20"), slippage_bps=0, fee_bps=0)
+    assert calculate_size(sig, risk_cfg(pct=1), ctx(Decimal("2000"))).amount_usd == \
+           calculate_size(sig, risk_cfg(pct=1), ctx(Decimal("1000"))).amount_usd * 2
+
+def test_risk_sizes_smaller_when_stop_is_wider():
+    # un stop más lejano exige una posición más pequeña para arriesgar lo mismo
+    near = calculate_size(sig, risk_cfg(pct=1), ctx_with(stop=Decimal("5"))).amount_usd
+    far  = calculate_size(sig, risk_cfg(pct=1), ctx_with(stop=Decimal("40"))).amount_usd
+    assert far < near
+
+def test_risk_includes_slippage_and_fees_on_both_legs():
+    # sin costes la fracción es 0.15 -> 66.66; con ellos sale menos
+    clean = calculate_size(sig, risk_cfg(pct=1), ctx_with(slip=0, fee=0)).amount_usd
+    assert clean == Decimal("66.66")
+    assert calculate_size(sig, risk_cfg(pct=1), ctx_with(slip=10, fee=10)).amount_usd < clean
+
+def test_risk_without_stop_loss_raises():
+    # sin stop no hay distancia que medir; la configuración ya lo impide, esto es la segunda red
+    with pytest.raises(ValueError, match="stop_loss_pct"):
+        calculate_size(sig, risk_cfg(pct=1), ctx_with(stop=None))
+
+def test_risk_with_zero_equity_returns_zero():
+    assert calculate_size(sig, risk_cfg(pct=1), ctx_with(equity=Decimal("0"))).amount_usd == Decimal("0")
+
+# --- reglas cruzadas nuevas en core/config.py ---
+
+def test_risk_strategy_requires_risk_pct():
+    with pytest.raises(ConfigError, match="risk_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=None, stop_loss_pct=15))
+
+def test_risk_strategy_requires_stop_loss():
+    with pytest.raises(ConfigError, match="stop_loss_pct"):
+        load_config(yaml_with(strategy="risk", risk_pct=1, stop_loss_pct=None))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -271,7 +388,18 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `calculate_size` y `apply_hard_cap` en `core/rules/sizing.py`**
 
-Función pura, sin E/S. El redondeo del resultado de `mirror` es a 2 decimales con `ROUND_DOWN`: redondear hacia abajo nunca gasta más de lo que la regla permite.
+Función pura, sin E/S. El redondeo de `mirror` y de `risk` es a 2 decimales con `ROUND_DOWN`: redondear hacia abajo nunca gasta más de lo que la regla permite.
+
+La fórmula de `risk` es la del spec §4.3.1:
+
+```
+fracción_estresada = stop_loss_pct/100 + 2*slippage_bps/10000 + 2*fee_bps/10000
+amount_usd         = (equity_usd * risk_pct/100) / fracción_estresada
+```
+
+El factor 2 en deslizamiento y comisión no es un adorno: hay una pata de entrada y otra de salida, y el stop no se ejecuta en su precio exacto sino algo peor. Omitirlo hace que el riesgo real supere siempre al declarado, que es el fallo que esta estrategia existe para evitar.
+
+`equity_usd` lo obtiene el motor (Tarea 12) de `MarketDataSource.get_balance()`. Con capital cero el importe es cero y no se lanza: es un estado legítimo, no un error.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -306,7 +434,7 @@ def test_stop_loss_triggers_below_threshold():
     assert d.reason is ExitReason.STOP_LOSS and d.fraction == Decimal("1")
 
 def test_stop_loss_not_triggered_exactly_at_threshold():
-    # 80 es exactamente -20%: el umbral se cruza, no se toca
+    # 80 es exactamente -20%: con desigualdad estricta, no dispara
     assert evaluate_exit(pos(entry=100), q(80), T1, cfg(stop_loss_pct=20), None) is None
 
 def test_copy_sell_partial_mirrors_fraction():
@@ -318,16 +446,31 @@ def test_take_profit_triggers_above_threshold():
     assert d.reason is ExitReason.TAKE_PROFIT
 
 def test_trailing_uses_peak_not_entry():
-    # pico 200, trailing 10% -> cierra en 179 aunque siga por encima de la entrada
+    # pico 200 -> armado, porque +100% supera el tp de 30%.
+    # trailing_pct 10 -> cierra por debajo de 200*0.9 = 180.
     d = evaluate_exit(pos(entry=100, peak=200), q(179), T1,
-                      cfg(primary="take_profit", tp_pct=30, trailing=True), None)
+                      cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None)
     assert d.reason is ExitReason.TAKE_PROFIT
+
+def test_trailing_holds_above_the_retrace_threshold():
+    # 181 sigue por encima de 180: no se devuelve suficiente, no cierra
+    assert evaluate_exit(pos(entry=100, peak=200), q(181), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
+
+def test_trailing_not_armed_below_take_profit_threshold():
+    # pico 120 = +20%, no alcanza el tp de 30%: el trailing no está armado y no cierra
+    assert evaluate_exit(pos(entry=100, peak=120), q(100), T1,
+                         cfg(primary="take_profit", tp_pct=30, trailing=True, trailing_pct=10), None) is None
 
 def test_trailing_disabled_by_default():
     assert cfg(primary="take_profit", tp_pct=30).trailing is False
 
+def test_trailing_requires_trailing_pct_in_config():
+    with pytest.raises(ConfigError, match="trailing_pct"):
+        load_config(yaml_with(primary="take_profit", take_profit_pct=30, trailing=True, trailing_pct=None))
+
 def test_time_stop_triggers_after_hours():
-    d = evaluate_exit(pos(opened_at=T0), q(100), T0 + timedelta(hours=49), T1,
+    d = evaluate_exit(pos(opened_at=T0), q(100), T0 + timedelta(hours=49),
                       cfg(primary="time_stop", time_stop_hours=48), None)
     assert d.reason is ExitReason.TIME_STOP
 
@@ -367,7 +510,16 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `evaluate_exit` y `next_peak_price` en `core/rules/exits.py`**
 
-Función pura. Evalúa en el orden fijo del spec §4.4 y devuelve en la primera coincidencia: stop-loss, copy-sell, take-profit (con trailing desde `peak_price` si está activo, desde `entry_price` si no), time-stop. Las condiciones 2–4 solo se consideran si coinciden con `cfg.primary`, salvo el time-stop, que actúa también como red de seguridad cuando `time_stop_hours` está configurado. Los umbrales se cruzan con desigualdad estricta.
+Función pura. Evalúa en el orden fijo del spec §4.4 y devuelve en la primera coincidencia: stop-loss, copy-sell, take-profit, time-stop.
+
+**Semántica del take-profit, con y sin trailing.** Son dos números distintos y no deben confundirse:
+
+- `trailing: false` — cierra cuando el precio sube más de `take_profit_pct` sobre la entrada.
+- `trailing: true` — `take_profit_pct` pasa a ser el umbral de **armado**: el trailing se activa cuando el **pico** supera ese porcentaje sobre la entrada. Una vez armado, cierra cuando el precio cae más de `trailing_pct` desde el pico. Antes de armarse no cierra nunca por esta vía.
+
+Reutilizar `take_profit_pct` como distancia de retroceso sería un error: con un take-profit del 30 % y pico en 200 desde una entrada de 100, saldrías en 140, devolviendo 60 de los 100 ganados. Son preguntas distintas: cuánto beneficio hace falta para interesarse, y cuánto se está dispuesto a devolver.
+
+**Esta tarea añade `trailing_pct: Decimal | None` a `ExitsConfig`** en `core/config.py`, en el rango (0, 100], con la regla cruzada de que `trailing: true` lo exige. Mismo criterio que la Tarea 4 con `risk_pct`: la Tarea 2 está cerrada y una funcionalidad tiene una sola dueña. Las condiciones 2–4 solo se consideran si coinciden con `cfg.primary`, salvo el time-stop, que actúa también como red de seguridad cuando `time_stop_hours` está configurado. Los umbrales se cruzan con desigualdad estricta.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -391,7 +543,7 @@ git commit -m "feat(core): añadir reglas de salida con precedencia fija"
 
 **Interfaces:**
 - Consumes: `RejectReason` (Tarea 1), `RiskConfig` (Tarea 2).
-- Produces: `RiskState` congelada con `utc_day: date`, `spent_usd_today: Decimal`, `realized_pnl_usd_today: Decimal`, `open_position_count: int`, `exposure_by_symbol: Mapping[str, Decimal]`. `evaluate_risk(amount_usd, symbol, state, cfg) -> RiskVerdict`. `RiskVerdict` congelada con `action: RiskAction` (`ALLOW`, `REJECT`, `SHUTDOWN`) y `reason: RejectReason | None`. `build_risk_state(repo, utc_day) -> RiskState`.
+- Produces: `RiskState` congelada con `utc_day: date`, `spent_usd_today: Decimal`, `realized_pnl_usd_today: Decimal`, `open_position_count: int`, `exposure_by_symbol: Mapping[str, Decimal]`. `evaluate_risk(amount_usd, symbol, state, cfg) -> RiskVerdict`. `RiskVerdict` congelada con `action: RiskAction` (`ALLOW`, `REJECT`, `SHUTDOWN`) y `reason: RejectReason | None`. `build_risk_state(repo, utc_day, exposure_by_symbol, open_position_count) -> RiskState`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -432,7 +584,12 @@ def test_build_risk_state_uses_fixed_utc_day_not_now():
     # Review Focus 2: el día se fija al inicio del ciclo, no se vuelve a leer
     repo.save_fill(fill_at(datetime(2026, 11, 4, 23, 59, tzinfo=utc), Decimal("100")))
     repo.save_fill(fill_at(datetime(2026, 11, 5, 0, 1, tzinfo=utc), Decimal("700")))
-    assert build_risk_state(repo, date(2026, 11, 4)).spent_usd_today == Decimal("100")
+    assert build_risk_state(repo, date(2026, 11, 4), {}, 0).spent_usd_today == Decimal("100")
+
+def test_build_risk_state_takes_exposure_from_caller():
+    # la exposición la agrega Portfolio (Tarea 11), no esta función: una sola agregación
+    s = build_risk_state(repo, D, {"BTC/USDT": Decimal("80")}, 3)
+    assert s.exposure_by_symbol == {"BTC/USDT": Decimal("80")} and s.open_position_count == 3
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -666,7 +823,7 @@ git commit -m "feat(storage): añadir log de auditoría inmutable"
 
 **Interfaces:**
 - Consumes: modelos de Tarea 1.
-- Produces: ABC `MarketDataSource` (`get_quote(symbol) -> Quote`, `get_balance() -> Decimal`), ABC `OrderExecutor` (`submit_buy(order) -> Fill`, `submit_sell(order) -> Fill`), ABC `SignalSource` (`fetch_trades(since) -> list[Signal]`, `list_followed() -> list[str]`, `name: str`), ABC `Notifier` (`send(message, level) -> None`). Excepción `QuoteUnavailable` en `ports/market.py` y enum `Level` (`INFO`, `WARNING`, `CRITICAL`) en `ports/notifier.py`. En `core/safety.py`: `mode_prefix(mode) -> str`, `is_kill_switch_active(root: Path) -> bool`, `CircuitBreaker(threshold=3)` con `record_failure()`, `record_success()`, `is_open`.
+- Produces: ABC `MarketDataSource` (`get_quote(symbol) -> Quote`, `get_balance() -> Decimal`), ABC `OrderExecutor` (`submit_buy(order) -> Fill`, `submit_sell(order) -> Fill`), ABC `SignalSource` (`fetch_trades(since) -> list[Signal]`, `list_followed() -> list[str]`, `name: str`), ABC `Notifier` (`send(message, level) -> None`). Excepciones `QuoteUnavailable` y `ZeroQuantity` en `ports/market.py`, y enum `Level` (`INFO`, `WARNING`, `CRITICAL`) en `ports/notifier.py`. En `core/safety.py`: `mode_prefix(mode) -> str`, `is_kill_switch_active(root: Path) -> bool`, `CircuitBreaker(threshold=3)` con `record_failure()`, `record_success()`, `is_open`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -827,8 +984,9 @@ def test_negative_quote_rejects_without_opening():
     assert r.rejected[0][1] is RejectReason.INVALID_QUOTE
 
 def test_quantity_rounding_to_zero_rejects():
-    # Review Focus 3: 50 USD de un activo a 120000 con 4 decimales redondea a 0
-    r = engine_with(quote=Decimal("120000"), amount=Decimal("50"), precision=4) \
+    # Review Focus 3. Ojo con la aritmética: 50/120000 = 0.000416, que con 4 decimales
+    # es 0.0004 y NO es cero. Hace falta un importe menor: 5/120000 = 0.0000416 -> 0.0000.
+    r = engine_with(quote=Decimal("120000"), amount=Decimal("5"), precision=4) \
         .run_entry_cycle(FakeSource([sig("t1")]), NOW)
     assert r.rejected[0][1] is RejectReason.ZERO_QUANTITY
 
@@ -878,7 +1036,11 @@ Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `Engine` en `core/engine.py`**
 
-`run_entry_cycle`, en este orden: comprobar kill switch; fijar `utc_day = now.date()` **una sola vez**; congelar allowlist; leer el cursor y pedir señales; filtrar por allowlist; para cada señal, calcular `client_order_id` y reservar el intent (si devuelve `False`, omitir como duplicado); obtener cotización y validarla (`> 0`, no `None`); evaluar riesgo (si `SHUTDOWN`, terminar el ciclo); calcular tamaño y aplicar el techo duro; convertir a cantidad y rechazar si redondea a cero; enviar al ejecutor; registrar posición y fill; auditar cada paso. El cursor avanza con `clamp_cursor` solo al final, si no hubo excepción.
+`run_entry_cycle`, en este orden: comprobar kill switch; fijar `utc_day = now.date()` **una sola vez**; congelar allowlist con `ensure_frozen_allowlist`; leer el cursor y pedir señales; filtrar por allowlist; para cada señal, obtener cotización y validarla (`> 0`, no `None`); construir el estado de riesgo con la exposición y el recuento que da `Portfolio`, y evaluarlo (si `SHUTDOWN`, terminar el ciclo); calcular tamaño y aplicar el techo duro; aplicar el **guardia de cantidad cero**; calcular `client_order_id` y reservar el intent (si devuelve `False`, omitir como duplicado); enviar al ejecutor; registrar posición y fill; auditar cada paso. El cursor avanza con `clamp_cursor` solo al final, si no hubo excepción.
+
+**El guardia de cantidad cero no calcula la cantidad definitiva.** Divide el importe entre el precio cotizado, redondea con el `quantity_precision` del mercado y rechaza con `ZERO_QUANTITY` si da cero. La cantidad autoritativa la produce el ejecutor desde el precio ya deslizado, y `Position.quantity` sale siempre del `Fill`, nunca de este guardia. El guardia existe para rechazar **antes** de consumir un `client_order_id`; si aun así el ejecutor lanza `ZeroQuantity`, el motor lo trata como orden fallida y marca el intent como fallido.
+
+La reserva del intent va **después** de los rechazos, no antes: un `client_order_id` reservado es irrepetible, y gastarlo en una señal que el riesgo iba a rechazar impediría reintentarla cuando las condiciones cambien.
 
 `run_exit_cycle`: para cada posición abierta, obtener cotización (si falla, acumular en `errors` y continuar con la siguiente), actualizar `peak_price` con `next_peak_price`, evaluar salida y cerrar si procede. No comprueba el kill switch.
 
@@ -906,7 +1068,7 @@ git commit -m "feat(core): añadir motor de decisión de entrada y salida"
 
 **Interfaces:**
 - Consumes: `OrderExecutor` (Tarea 10), `MarketDataSource` (Tarea 10), `Order`, `Fill` (Tarea 1).
-- Produces: `PaperExecutor(data_source, slippage_bps: int, fee_bps: int)` implementando `OrderExecutor`.
+- Produces: `PaperExecutor(data_source, slippage_bps: int, fee_bps: int, quantity_precision: int)` implementando `OrderExecutor`. Los tres enteros salen de `config.execution[market]` (Tarea 2); el ejecutor no los fija por su cuenta.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -933,7 +1095,18 @@ def test_fill_carries_client_order_id():
 
 def test_uses_real_quote_from_data_source():
     # spec §3.3: el dinero es falso, los precios no
-    assert PaperExecutor(src(42), 0, 0).submit_buy(order(Decimal("42"))).price == Decimal("42")
+    assert PaperExecutor(src(42), 0, 0, 8).submit_buy(order(Decimal("42"))).price == Decimal("42")
+
+def test_raises_when_quantity_rounds_to_zero():
+    # El ejecutor es la autoridad sobre la cantidad: si el redondeo la anula, falla.
+    # Cuidado con la aritmética: 50/120000 = 0.000416 -> 0.0004 con 4 decimales, NO es cero.
+    # Con 5 USD: 5/120000 = 0.0000416 -> 0.0000.
+    with pytest.raises(ZeroQuantity):
+        PaperExecutor(src(120000), 0, 0, quantity_precision=4).submit_buy(order(Decimal("5")))
+
+def test_quantity_respects_configured_precision():
+    f = PaperExecutor(src(3), 0, 0, quantity_precision=2).submit_buy(order(Decimal("10")))
+    assert f.quantity == Decimal("3.33")  # ROUND_DOWN, nunca compra de más
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -944,6 +1117,8 @@ Expected: FAIL con `ModuleNotFoundError`
 - [ ] **Step 3: Implement `PaperExecutor`**
 
 Pide la cotización real al `MarketDataSource` que recibe por constructor, aplica el deslizamiento en la dirección que perjudica al operador (sumando en compras, restando en ventas), calcula la comisión sobre el nocional y devuelve un `Fill`.
+
+La cantidad se redondea con `ROUND_DOWN` a `quantity_precision` decimales, y si da cero se lanza `ZeroQuantity` en lugar de devolver un `Fill` vacío. Este ejecutor es la autoridad sobre la cantidad: el guardia del motor (Tarea 12) solo rechaza antes de reservar el intent, y la cantidad que se persiste en la posición sale siempre de este `Fill`.
 
 El deslizamiento va siempre en contra a propósito: un simulador optimista convierte estrategias perdedoras en ganadoras sobre el papel, que es exactamente lo que el spec §6.2 quiere evitar.
 
@@ -1015,7 +1190,13 @@ Expected: FAIL con `ModuleNotFoundError`
 
 `run_backtest` construye un `Engine` real con `HistoricalSource` y `PaperExecutor`, y avanza el reloj en pasos de `step` desde `start` hasta `end`, llamando a `run_entry_cycle` y `run_exit_cycle` en cada paso con ese `now` simulado. Esto es lo que garantiza que backtest y operación en vivo compartan motor.
 
-`compute_metrics` usa `statistics` de la stdlib para el Sharpe; no hace falta `pandas` para esto y evita una dependencia pesada. Los ratios se redondean a 4 decimales. Toda división comprueba antes el divisor: con cero operaciones cerradas, las métricas valen cero en lugar de lanzar.
+**`compute_metrics` delega en `quantstats` (0.0.86, ya instalado) todo lo que sea estadística estándar**: drawdown máximo, Sharpe, Sortino, volatilidad, win rate, expectancy. Construye una serie de retornos a partir de los fills y se la pasa.
+
+Razón para no calcularlo a mano: el Sharpe anualizado, el drawdown sobre una curva con aportaciones y la expectancy tienen convenios sutiles que es fácil equivocar en silencio, y un número de rendimiento equivocado es peor que no tenerlo, porque se actúa sobre él. `quantstats` además genera un informe HTML completo con `qs.reports.html(...)`, que la CLI expone como `backtest --report <fichero>`.
+
+**Lo que NO se delega: `closes_by_reason`.** Esa métrica es propia de este bot y es la que dice si los umbrales están calibrados; se calcula aquí y se añade al informe.
+
+Toda división comprueba antes el divisor: con cero operaciones cerradas las métricas valen cero en lugar de lanzar, y ese camino se prueba **sin** llamar a `quantstats`, porque una serie vacía le hace devolver `NaN`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1091,6 +1272,8 @@ Run: `pytest tests/adapters/cex/test_source.py -v`
 Expected: FAIL con `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement `CexDataSource` y `CexCsvSignalSource`**
+
+**`get_balance()` devuelve el capital TOTAL de la cuenta, incluido el valor de las posiciones abiertas**, no el efectivo libre. En `ccxt` eso es el `total` del balance, no el `free`. El contrato no es cosmético: la protección de drawdown compara el capital actual contra un pico persistido, así que si esta función devolviera efectivo libre, abrir posiciones lo bajaría por debajo del pico y la protección bloquearía todas las entradas de forma permanente.
 
 `CexDataSource` envuelve `ccxt`, llamando a `fetch_ticker`. El cliente de `ccxt` se inyecta por un constructor alternativo `from_client` para que los tests no toquen la red. Los precios se convierten con `Decimal(str(valor))`, nunca `Decimal(float)`. Cualquier error de `ccxt` o precio no positivo se envuelve en `QuoteUnavailable` (definida en `ports/market.py`, Tarea 10), de forma que el motor lo trate con el camino de `INVALID_QUOTE` ya probado en la Tarea 12.
 
@@ -1237,7 +1420,18 @@ Expected: FAIL con `ModuleNotFoundError`
 
 `ConfigError` se captura en la frontera de la CLI y se muestra como mensaje, no como traza.
 
-`run` monta dos bucles independientes con los valores de `CadenceConfig`: entrada al inicio de cada hora y salida cada `exit_interval_seconds`. El planificador se inyecta para que los tests no esperen en tiempo real, y `--once` ejecuta un solo ciclo de cada uno y termina.
+**Protecciones omitidas: romper el silencio.** Las protecciones valen `0` por defecto, y `0` las desactiva. Eso significa que una configuración que simplemente **no escriba** la sección `protections` corre sin ninguna de las cuatro y sin ninguna señal. El `extra="forbid"` atrapa una errata *dentro* de la sección, pero no una sección ausente. Por tanto, en el arranque:
+
+- En `mode: live`, la clave `protections` **debe estar presente**. Así, correr sin protecciones es una decisión explícita y escrita, no un olvido. Si falta, `ConfigError`.
+- En `paper` y en `backtest`, si las cuatro están a cero se emite un **aviso** al arrancar, por el notificador y por la salida estándar, diciendo cuáles están desactivadas.
+
+Tests: `mode: live` sin sección `protections` lanza `ConfigError` nombrando la clave; `mode: paper` con todo a cero arranca pero avisa; una configuración con protecciones activas no avisa.
+
+`run` monta dos trabajos independientes con **`apscheduler` (3.11.3, ya instalado)**: `CronTrigger` para la entrada con `cadence.entry_cron`, e `IntervalTrigger` para la salida con `cadence.exit_interval_seconds`. `--once` ejecuta un ciclo de cada uno y termina, sin planificador.
+
+Razón para no escribirlo a mano: un bucle propio hay que enseñarle qué hacer cuando un ciclo tarda más que su intervalo, cuando el equipo se suspende y se pierden disparos, y cuando hay que reanudar tras un reinicio. `apscheduler` ya resuelve los tres. Configúralo con `max_instances=1` y `coalesce=True`: si el equipo despierta tras dos horas suspendido, se ejecuta **un** ciclo de entrada, no dos encolados, y nunca dos ciclos a la vez sobre la misma base de datos.
+
+El planificador se inyecta para que los tests no esperen en tiempo real.
 
 `pyproject.toml` fija `requires-python = ">=3.11"` y las dependencias: `pydantic`, `pyyaml`, `ccxt`, `typer`, `httpx`, y `pytest` en el grupo de desarrollo. El README documenta instalación, el fichero de configuración y los comandos.
 
@@ -1251,6 +1445,109 @@ Expected: PASS, toda la batería
 ```bash
 git add cli.py pyproject.toml README.md tests/test_cli.py
 git commit -m "feat(cli): añadir CLI, empaquetado y documentación"
+```
+
+---
+
+### Task 18: Protecciones
+
+**Se ejecuta después de la Tarea 11 y ANTES de la Tarea 12**, porque el motor las consume. El número es alto solo porque se añadió al plan más tarde.
+
+**Files:**
+- Create: `core/rules/protections.py`
+- Modify: `core/config.py` (sección `protections` y `groups`). **No toca `core/rules/risk.py`**: las protecciones las invoca el motor (Tarea 12), no los gates de riesgo. Son dos decisiones independientes que el motor consulta en orden.
+- Test: `tests/core/rules/test_protections.py`
+
+**Interfaces:**
+- Consumes: `Position`, `Fill`, `ExitReason`, `RejectReason` (T1), `Portfolio` (T11).
+- Produces: `ProtectionsConfig` con `cooldown_minutes: int`, `stop_loss_streak: int`, `streak_window_hours: int`, `streak_pause_hours: int`, `max_drawdown_pct: Decimal`, `max_usd_per_group: Decimal`, y `groups: dict[str, list[str]]` en `BotConfig`. `evaluate_protections(symbol, amount_usd, state, cfg, now) -> ProtectionVerdict`. `ProtectionVerdict` congelada con `blocked: bool`, `reason: RejectReason | None`, `until: datetime | None`. Nuevos miembros de `RejectReason`: `COOLDOWN`, `STOP_LOSS_STREAK`, `MAX_DRAWDOWN`, `MAX_USD_PER_GROUP`. `group_of(symbol, groups) -> str`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+def test_cooldown_blocks_reentry_after_a_loss():
+    # cerró en pérdida hace 30 min, cooldown 60 -> bloqueado
+    v = evaluate_protections("BONK", D50, state_with_loss("BONK", minutes_ago=30), cfg(cooldown=60), NOW)
+    assert v.blocked and v.reason is RejectReason.COOLDOWN
+
+def test_cooldown_expires():
+    v = evaluate_protections("BONK", D50, state_with_loss("BONK", minutes_ago=61), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+def test_cooldown_does_not_apply_to_a_profitable_close():
+    # solo las pérdidas enfrían; cerrar en ganancia no castiga
+    v = evaluate_protections("BONK", D50, state_with_win("BONK", minutes_ago=5), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+def test_cooldown_is_per_symbol():
+    v = evaluate_protections("WIF", D50, state_with_loss("BONK", minutes_ago=5), cfg(cooldown=60), NOW)
+    assert v.blocked is False
+
+def test_stop_loss_streak_pauses_all_entries():
+    # 3 stop-loss en 24h -> bloquea cualquier símbolo, no solo los de la racha
+    v = evaluate_protections("ETH/USDT", D50, state_with_stops(3, hours=20), cfg(streak=3, window=24), NOW)
+    assert v.blocked and v.reason is RejectReason.STOP_LOSS_STREAK
+
+def test_stop_loss_streak_ignores_stops_outside_the_window():
+    v = evaluate_protections("ETH/USDT", D50, state_with_stops(3, hours=30), cfg(streak=3, window=24), NOW)
+    assert v.blocked is False
+
+def test_only_stop_loss_closes_count_towards_the_streak():
+    # tres cierres por time-stop no son una racha de stops
+    v = evaluate_protections("ETH/USDT", D50, state_with_closes(ExitReason.TIME_STOP, 3), cfg(streak=3), NOW)
+    assert v.blocked is False
+
+def test_max_drawdown_blocks_entries():
+    v = evaluate_protections("ETH/USDT", D50, state(peak=D1000, equity=D880), cfg(max_dd=10), NOW)
+    assert v.blocked and v.reason is RejectReason.MAX_DRAWDOWN
+
+def test_max_drawdown_allows_exactly_at_threshold():
+    # 900 desde un pico de 1000 es exactamente -10%: desigualdad estricta
+    assert evaluate_protections("ETH/USDT", D50, state(peak=D1000, equity=D900), cfg(max_dd=10), NOW).blocked is False
+
+def test_correlated_group_exposure_is_summed():
+    # BONK y WIF son el mismo grupo: 60+60 = 120 > 100
+    st = state(exposure={"BONK": D60}, groups={"solana_memes": ["BONK", "WIF"]})
+    v = evaluate_protections("WIF", D60, st, cfg(max_group=100), NOW)
+    assert v.blocked and v.reason is RejectReason.MAX_USD_PER_GROUP
+
+def test_symbols_in_different_groups_do_not_add_up():
+    st = state(exposure={"BONK": D60}, groups={"solana_memes": ["BONK"], "majors": ["ETH/USDT"]})
+    assert evaluate_protections("ETH/USDT", D60, st, cfg(max_group=100), NOW).blocked is False
+
+def test_ungrouped_symbol_is_its_own_group():
+    assert group_of("ETH/USDT", {"solana_memes": ["BONK"]}) == "ETH/USDT"
+
+def test_protections_never_block_exits():
+    # las protecciones solo se consultan en el camino de entrada
+    assert "exit" not in inspect.signature(evaluate_protections).parameters
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/core/rules/test_protections.py -v`
+Expected: FAIL con `ModuleNotFoundError`
+
+- [ ] **Step 3: Implement `evaluate_protections` y `group_of` en `core/rules/protections.py`**
+
+Función pura. Evalúa en este orden y devuelve en la primera coincidencia: racha de stop-loss (la más global), drawdown máximo, cooldown del símbolo, exposición del grupo. Todos los umbrales con desigualdad estricta, como el resto del proyecto.
+
+`group_of` devuelve el nombre del grupo que contiene el símbolo, o el propio símbolo si no está en ninguno. Así el límite por grupo nunca es más laxo que el límite por token.
+
+Las protecciones **solo bloquean entradas**. Una posición abierta se sigue vigilando y cerrando con normalidad pase lo que pase: si el drawdown dispara y además una posición toca su stop, la posición se cierra. Bloquear salidas convertiría una protección en una trampa.
+
+El motor (Tarea 12) las consulta **después** del apagado por pérdida diaria y **antes** de los gates de §4.5, porque su motivo es más informativo.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pytest tests/core/rules/test_protections.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/rules/protections.py core/config.py core/rules/risk.py tests/core/rules/test_protections.py
+git commit -m "feat(core): añadir protecciones de frecuencia y exposición por grupo"
 ```
 
 ---

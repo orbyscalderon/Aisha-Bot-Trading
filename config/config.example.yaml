@@ -1,0 +1,37 @@
+# Configuración de ejemplo. Valores elegidos para limitar la pérdida máxima
+# antes que para maximizar la ganancia.
+#
+# Exposición máxima simultánea: 5 posiciones x 50 USD por token = 250 USD.
+# El bot se apaga solo al perder 50 USD en un día.
+# La salida primaria prevista es copy_sell (copiar la salida del trader es el copy-trading),
+# pero NO está conectada en el plan 1: hoy las salidas efectivas son solo el stop-loss
+# del 15 % y el time-stop de 72 h (el bot avisa de ello al arrancar).
+# El cooldown evita insistir: si un trader seguido entra y sale tres veces de un token que
+# se desploma, sin cooldown el bot copia las tres y pierde las tres. Las protecciones solo
+# bloquean entradas, nunca salidas.
+# El trailing va desactivado: persigue máximos y en activos ruidosos cierra antes de tiempo.
+mode: paper
+sizing:   { strategy: flat, flat_amount_usd: 25 }
+exits:    { stop_loss_pct: 15, primary: copy_sell, time_stop_hours: 72, trailing: false }
+risk:
+  max_usd_per_token:   50
+  max_open_positions:  5
+  max_usd_per_day:     150
+  max_daily_loss_usd:  50
+  hard_max_order_usd:  50
+cadence:  { entry_cron: "0 * * * *", exit_interval_seconds: 60 }
+protections:
+  cooldown_minutes:    60    # tras cerrar en pérdida, no reabrir ese símbolo en 1 h
+  stop_loss_streak:    3     # 3 stop-loss en la ventana...
+  streak_window_hours: 24
+  streak_pause_hours:  12    # ...pausan toda apertura 12 h
+  max_drawdown_pct:    10    # caída desde el máximo de capital
+  max_usd_per_group:   100   # exposición sumada de símbolos correlacionados
+groups:
+  # Símbolos que caen juntos. Uno que no aparezca aquí forma su propio grupo
+  # de uno, así que el límite por grupo nunca es más laxo que el de por token.
+  solana_memes: [BONK, WIF]
+cex:
+  # Activos del exchange que no cuentan para el capital (residuos ajenos al bot).
+  # Cuidado: listar USDT/USDC aquí quita ese efectivo del capital.
+  ignore_assets: []

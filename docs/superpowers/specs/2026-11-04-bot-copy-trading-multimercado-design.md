@@ -140,7 +140,7 @@ Deliberadamente son **dos puertos distintos**:
 ```python
 class MarketDataSource(ABC):
     def get_quote(self, symbol: str) -> Quote: ...
-    def get_balance(self) -> Decimal: ...
+    def get_balance(self) -> Decimal: ...   # capital TOTAL, con las posiciones abiertas
 
 class OrderExecutor(ABC):
     def submit_buy(self, order: Order) -> Fill: ...
@@ -186,15 +186,42 @@ Razón para separarlos: un stop-loss que solo se comprueba una vez por hora no e
 
 ### 4.3 Tamaño de posición
 
-Dos estrategias, exclusivas entre sí:
+Tres estrategias, exclusivas entre sí:
 
 | Estrategia | Comportamiento |
 |---|---|
-| `flat` | Importe fijo en USD por compra. `flat_amount_usd: 50` |
+| `flat` | Importe fijo en USD por compra. `flat_amount_usd: 25` |
 | `mirror` | Porcentaje del tamaño del trader, con tope. `mirror_pct: 10`, `mirror_cap_usd: 200` |
+| `risk` | Importe tal que la pérdida al tocar el stop sea un porcentaje fijo del capital |
 
 En `mirror`, si el tamaño del trader no está disponible en la fuente, se cae a `flat` y se
 notifica. Nunca se adivina un tamaño.
+
+### 4.3.1 Dimensionar por riesgo
+
+La estrategia `risk` calcula el importe a partir de lo que se está dispuesto a perder, no de
+una cantidad arbitraria:
+
+```
+riesgo_usd        = capital × risk_pct
+fracción_estresada = stop_loss_pct/100
+                   + 2 × slippage_bps/10000      (deslizamiento de entrada y de stop)
+                   + 2 × fee_bps/10000           (comisión de entrada y de salida)
+importe_usd       = riesgo_usd / fracción_estresada
+```
+
+Por qué es mejor que el importe fijo: con `flat`, una compra de 25 USD en un activo con stop
+al 5 % arriesga 1,25 USD, y la misma compra con stop al 40 % arriesga 10. El riesgo real por
+operación varía ocho veces sin que nadie lo haya decidido. Con `risk`, **toda operación
+arriesga lo mismo**, que es lo que permite razonar sobre la pérdida máxima de una racha.
+
+La fracción es *estresada* a propósito: el stop no se ejecuta en su precio exacto sino algo
+peor, y hay comisión en las dos patas. Ignorarlo hace que el riesgo real supere siempre al
+declarado.
+
+`risk` exige `stop_loss_pct` configurado: sin stop no hay distancia que medir, y la
+configuración no valida esa combinación. El techo duro por orden (§7.3) se aplica después,
+como con cualquier otra estrategia.
 
 Sobre el resultado de cualquier estrategia se aplica el **techo duro por orden** (§7.3), que es
 independiente de estas reglas y actúa como último filtro.
@@ -218,6 +245,38 @@ time-stop pueden coexistir con ella como red de seguridad.
 
 En modo real, el stop-loss es **obligatorio**. La configuración no valida sin él.
 
+### 4.4.1 El stop vive en el exchange, no en el bot
+
+Al abrir una posición en modo real se coloca, además de la orden de entrada, una **orden stop
+reduce-only en el propio mercado**, al precio del stop-loss configurado.
+
+Razón: un stop-loss evaluado por el bucle de salida solo protege mientras el bot está vivo. Si
+el proceso muere, el portátil se suspende o se cae la conexión, la posición queda sin
+protección justo cuando más falta hace. Una orden en reposo en el exchange se ejecuta aunque
+todo lo del usuario esté apagado.
+
+Consecuencias de diseño:
+
+- El bucle de salida sigue existiendo: evalúa `copy_sell`, `take_profit`, `trailing` y
+  `time_stop`, que el exchange no puede conocer. El stop en el mercado es una red por debajo,
+  no un reemplazo.
+- **Reconciliación de stops.** Al arrancar, y en cada ciclo de salida, el bot comprueba que
+  cada posición abierta tiene su stop vivo en el mercado. Si falta, lo recoloca y avisa.
+- **Cancelación al cerrar.** Al cerrar una posición por cualquier otra vía, su stop se cancela.
+  Un stop huérfano puede ejecutarse más tarde y abrir una posición corta no deseada.
+- **Posición desprotegida con plazo.** Si tras `unprotected_deadline_seconds` (120 por defecto)
+  una posición sigue sin stop confirmado en el mercado, el bot la cierra a mercado. Es
+  preferible salir plano a quedarse expuesto sin red.
+- Los mercados que no admiten órdenes stop en reposo (según el adaptador) se marcan en
+  configuración y el bot lo advierte al arrancar en modo real: en ellos el stop solo existe
+  mientras el proceso viva.
+
+**Cuándo se construye.** Las órdenes stop en reposo son mecánica de ejecución real y llegan con
+el adaptador correspondiente (plan 3). Hasta entonces, el bucle de salida que comprueba precios
+cada 60 s cubre la misma condición con la única diferencia de la granularidad temporal. La
+diferencia importa cuando hay dinero real y el proceso puede morir; con dinero simulado y el
+proceso vivo, no.
+
 ### 4.5 Gates de riesgo
 
 Se evalúan **antes** de calcular el tamaño. Una operación rechazada se registra con su motivo y
@@ -233,6 +292,42 @@ se notifica; no se descarta en silencio.
 La última es distinta a propósito. Un bot que sigue operando después de cruzar su límite de
 pérdida diaria no tiene límite de pérdida diaria.
 
+### 4.5.1 Protecciones
+
+Los gates de §4.5 limitan **cuánto** se arriesga. Las protecciones limitan **con qué
+frecuencia**: impiden repetir un error mientras las condiciones que lo provocaron siguen ahí.
+La idea está tomada de las *protections* de freqtrade.
+
+| Protección | Dispara cuando | Efecto | Por defecto |
+|---|---|---|---|
+| `cooldown_minutes` | Se cierra una posición en pérdida | Prohíbe reabrir **ese símbolo** | 60 |
+| `stop_loss_streak` | N stop-loss dentro de `streak_window_hours` | Bloquea **toda** apertura durante `streak_pause_hours` | 3 en 24 h, pausa 12 h |
+| `max_drawdown_pct` | La caída desde el máximo histórico de capital supera el umbral | Bloquea aperturas hasta recuperar | 10 % |
+| `max_usd_per_group` | La exposición sumada de un grupo correlacionado lo supera | Rechaza esa compra | 100 |
+
+**Por qué el cooldown.** Hoy, si un trader seguido entra y sale tres veces en un token que se
+está desplomando, el bot le copia las tres y pierde las tres. Ninguna regla actual lo impide:
+cada operación por separado respeta el tamaño, el stop y los límites diarios. Lo que falla no
+es el tamaño de cada apuesta sino insistir en la misma apuesta perdedora.
+
+**Por qué la racha de stop-loss.** Tres stops seguidos no suelen ser mala suerte: suelen ser un
+cambio de régimen de mercado que el trader seguido todavía no ha asimilado. Parar doce horas
+cuesta las oportunidades de medio día; no parar cuesta el resto de la racha.
+
+**Por qué el límite por grupo correlacionado.** `max_open_positions: 5` trata cinco posiciones
+como diversificación. **Si son cinco memecoins de Solana, no son cinco apuestas: son una sola
+apuesta repetida cinco veces**, y caerán juntas. El límite por token no ve esa correlación
+porque mira símbolo a símbolo.
+
+Los grupos se declaran en configuración (`groups: {solana_memes: [BONK, WIF, ...]}`). Un
+símbolo que no aparece en ningún grupo forma su propio grupo de uno, de modo que el límite por
+grupo nunca es más laxo que el límite por token.
+
+**Dónde encajan.** Las protecciones se evalúan **después** del apagado por pérdida diaria y
+**antes** de los demás rechazos: son más específicas y su motivo es más informativo. Ninguna
+afecta a las salidas: una posición abierta se sigue vigilando y cerrando con normalidad, pase
+lo que pase con las protecciones. Bloquean entradas, nunca salidas.
+
 ### 4.6 Kill switch
 
 Un fichero llamado `STOP` en la raíz detiene toda apertura de posición en el siguiente ciclo.
@@ -245,9 +340,26 @@ reiniciar el proceso.
 Reintentar puede comprar dos veces. No reintentar puede dejar una posición abierta sin registro.
 Ambos escenarios son pérdidas reales.
 
-**La solución.** Cada orden lleva un `client_order_id` determinista, derivado por hash de
-`(signal_id, trader_id, symbol, side, cycle_timestamp)`. La misma señal procesada dos veces
-produce el mismo identificador.
+**La solución.** Cada orden lleva un `client_order_id` determinista, derivado por hash de:
+
+- **Entradas:** `(signal_id, trader_id, symbol, side)`.
+- **Salidas:** `(position_id, side, exit_reason)`.
+
+**Ninguno de los dos incluye la hora del ciclo, y esa ausencia es el punto entero.** Una
+versión anterior de este spec incluía `cycle_timestamp` en el hash, lo que anulaba la garantía
+sin que se notara: un ciclo abre una posición, el proceso cae antes de que avance el cursor, y
+al reiniciar la misma señal llega con otro reloj, produce otro identificador, la reserva tiene
+éxito y **se compra dos veces**. Es exactamente el fallo que esta sección existe para impedir.
+
+La unicidad la aporta `signal_id`, que las fuentes derivan de forma estable del contenido de la
+señal. Si el mismo trader repite la misma operación más tarde, es otra señal con otro
+`signal_id`, así que no colisionan.
+
+**Una salida fallida debe poder reintentarse.** Un intent en estado `FAILED` puede volver a
+reservarse (`FAILED → RESERVED`), porque `FAILED` significa que sabemos que la orden **no** se
+ejecutó. Sin esta transición, un stop-loss que falla una vez quedaría bloqueado como duplicado
+para siempre y la posición no podría cerrarse nunca, que es el peor desenlace posible de un
+esquema de identificadores. Los estados `RESERVED`, `SENT` y `CONFIRMED` siguen bloqueando.
 
 El flujo, en este orden exacto:
 
