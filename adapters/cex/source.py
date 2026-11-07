@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable
 import ccxt
 
 from core.models import Market, Quote, Side, Signal
-from ports.market import MarketDataSource, QuoteUnavailable
+from ports.market import MarketDataSource, MarketUnpriceable, QuoteUnavailable
 from ports.signal_source import SignalSource
 
 MAX_ATTEMPTS = 3
@@ -29,11 +29,11 @@ _QUOTE_ASSETS = ("USDT", "USDC", "FDUSD", "BUSD")
 logger = logging.getLogger(__name__)
 
 
-class _MarketMissing(QuoteUnavailable):
+class _MarketMissing(MarketUnpriceable):
     """El par no existe en el exchange (no es un fallo transitorio)."""
 
 
-class _NoPrice(QuoteUnavailable):
+class _NoPrice(MarketUnpriceable):
     """El par existe pero su ticker no trae precio utilizable (nulo o no positivo)."""
 
 

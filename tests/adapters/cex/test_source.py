@@ -87,6 +87,18 @@ def test_get_quote_wraps_network_error():
         source(client).get_quote("X/USDT")
 
 
+def test_permanent_failures_are_unpriceable_and_transient_ones_are_not():
+    # Contrato que Portfolio usa para decidir entre omitir y propagar.
+    from ports.market import MarketUnpriceable
+    with pytest.raises(MarketUnpriceable):
+        source(FakeCcxt({"last": None})).get_quote("X/USDT")
+    with pytest.raises(MarketUnpriceable):
+        source(FakeCcxt(fail_times=99, error=ccxt.BadSymbol)).get_quote("X/USDT")
+    with pytest.raises(QuoteUnavailable) as info:
+        source(FakeCcxt(fail_times=99, error=ccxt.NetworkError)).get_quote("X/USDT")
+    assert not isinstance(info.value, MarketUnpriceable)
+
+
 def test_get_quote_wraps_bad_symbol_without_retry():
     client = FakeCcxt(fail_times=99, error=ccxt.BadSymbol)
     with pytest.raises(QuoteUnavailable):

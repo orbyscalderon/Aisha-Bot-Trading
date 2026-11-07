@@ -16,7 +16,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from core.models import Fill, Position, Quote, Side
-from ports.market import QuoteUnavailable
+from ports.market import MarketUnpriceable
 from storage.repository import Repository
 
 _ZERO = Decimal(0)
@@ -74,10 +74,12 @@ class Portfolio:
         """Capital simulado: inicial + efectivo de todos los fills + valor a mercado de lo abierto.
 
         Única implementación (modo simulado y backtest la comparten: si cada uno tuviera la
-        suya, divergirían). Política de una posición sin cotización: se OMITE su valoración
-        con un WARNING, no se falla. Fallar congelaría TODAS las entradas, de cualquier
-        símbolo, mientras dure un solo activo deslistado; omitirla solo subestima el capital
-        (el lado conservador: tamaños menores) y es lo que ya hace el adaptador de CEX.
+        suya, divergirían). Política según el fallo de cotización de una posición abierta:
+        - MarketUnpriceable (permanente: sin mercado o sin precio): se OMITE su valoración con
+          un WARNING. Fallar congelaría TODAS las entradas mientras dure un solo activo ajeno.
+        - QuoteUnavailable a secas (transitorio: red, límite de tasa): se PROPAGA. Omitirlo
+          bajaría el capital por un parpadeo y encogería tamaños o dispararía el drawdown;
+          el siguiente ciclo reintenta. Es la misma política que ya aplica el adaptador de CEX.
         """
         cash = initial
         for f in self._repo.fills_between(_EPOCH, _FOREVER):
@@ -87,7 +89,7 @@ class Portfolio:
         for p in self._repo.open_positions():
             try:
                 held += p.quantity * quote_fn(p.symbol).price
-            except QuoteUnavailable as exc:
+            except MarketUnpriceable as exc:
                 logger.warning(
                     "capital: sin cotización para %s (posición %s); se omite su valoración (%s)",
                     p.symbol, p.id, exc,

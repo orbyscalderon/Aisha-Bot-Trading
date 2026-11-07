@@ -49,7 +49,7 @@ from core.engine import Engine
 from core.models import Fill, Market, Position, Quote, Signal
 from core.portfolio import Portfolio
 from core.safety import CircuitBreaker
-from ports.market import MarketDataSource, QuoteUnavailable
+from ports.market import MarketDataSource, MarketUnpriceable, QuoteUnavailable
 from ports.notifier import Level, Notifier
 from ports.signal_source import SignalSource
 from storage.audit import AuditLog
@@ -106,7 +106,8 @@ class HistoricalSource(SignalSource, MarketDataSource):
         now = self._now()
         times = self._quote_times.get(symbol)
         if not times:
-            raise QuoteUnavailable(symbol)
+            # Sin ninguna cotización en todo el dataset: no se podrá valorar nunca (permanente).
+            raise MarketUnpriceable(symbol)
         i = bisect.bisect_right(times, now)
         if i == 0:
             raise QuoteUnavailable(f"{symbol}: sin cotización a {now.isoformat()}")

@@ -152,20 +152,34 @@ def test_total_equity_is_initial_plus_cash_flow_plus_mark_to_market(repo):
     assert equity == Decimal(1039)
 
 
-def test_total_equity_skips_unquotable_position_with_a_warning(repo, caplog):
+def test_total_equity_skips_unpriceable_position_with_a_warning(repo, caplog):
     # Política única: una posición sin cotización NO congela el capital (y con él todas las
     # entradas); se omite su valoración y se avisa. Igual que el adaptador de CEX.
-    from ports.market import QuoteUnavailable
+    from ports.market import MarketUnpriceable
     ok = pos("BTC/USDT", amount=200, entry=100, qty="2")
     gone = pos("DEAD/USDT", amount=100, entry=10, qty="10")
     repo_with(repo, ok, gone)
 
     def quote(symbol):
         if symbol == "DEAD/USDT":
-            raise QuoteUnavailable(symbol)
+            raise MarketUnpriceable(symbol)
         return q(120, symbol)
 
     with caplog.at_level("WARNING"):
         equity = Portfolio(repo).total_equity_usd(quote, Decimal(1000))
     assert equity == Decimal(1240)  # 1000 + 2 x 120; DEAD fuera
     assert "DEAD/USDT" in caplog.text
+
+
+def test_total_equity_propagates_a_transient_quote_failure(repo):
+    # Un parpadeo de red NO debe bajar el capital en silencio: encogería tamaños y podría
+    # disparar la protección de drawdown. Se propaga y el ciclo siguiente reintenta.
+    from ports.market import MarketUnpriceable, QuoteUnavailable
+    repo_with(repo, pos("BTC/USDT", amount=200, entry=100, qty="2"))
+
+    def quote(symbol):
+        raise QuoteUnavailable("timeout de red")
+
+    with pytest.raises(QuoteUnavailable) as info:
+        Portfolio(repo).total_equity_usd(quote, Decimal(1000))
+    assert not isinstance(info.value, MarketUnpriceable)

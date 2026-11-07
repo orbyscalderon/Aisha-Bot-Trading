@@ -74,6 +74,9 @@ class EntryCycleResult:
 class ExitCycleResult:
     closed: list[Position] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Subconjunto de ``errors`` que el motor ya notificó uno a uno (CRITICAL o WARNING).
+    # Quien resuma el ciclo debe excluirlos para no avisar dos veces de lo mismo.
+    alerted: list[str] = field(default_factory=list)
 
 
 class ExitRefused(Exception):
@@ -369,6 +372,7 @@ class Engine:
     def run_exit_cycle(self, now: datetime) -> ExitCycleResult:
         closed: list[Position] = []
         errors: list[str] = []
+        alerted: list[str] = []
         for position in self._portfolio.open_positions():
             try:
                 quote = self._quote(position.symbol)
@@ -384,17 +388,19 @@ class Engine:
             except ExitRefused as exc:
                 # Ya se avisó con CRITICAL: solo queda constancia en el resultado y la auditoría.
                 errors.append(str(exc))
+                alerted.append(str(exc))
                 self._log("exit_error", now, position_id=position.id, error=str(exc))
                 continue
             except Exception as exc:  # noqa: BLE001 - una posición no aborta a las demás
                 msg = f"{position.id}: {exc!r}"
                 errors.append(msg)
+                alerted.append(msg)
                 self._log("exit_error", now, position_id=position.id, error=msg)
                 self._notify(f"error cerrando {position.symbol}: {exc!r}", Level.WARNING)
                 continue
             if done is not None:
                 closed.append(done)
-        return ExitCycleResult(closed, errors)
+        return ExitCycleResult(closed, errors, alerted)
 
     def _process_exit(self, position: Position, quote: Quote, now: datetime) -> Position | None:
         # La monotonía del pico vive en next_peak_price; el repositorio guarda lo que le den.
@@ -423,17 +429,27 @@ class Engine:
         ):
             self._log("exit_duplicate", now, position_id=position.id, client_order_id=coid)
             intent = self._repo.get_intent(coid)
-            if intent is not None and intent.status is IntentStatus.SENT:
-                # En una compra, SENT bloqueando el reintento evita un doble gasto. En una
-                # SALIDA te deja dentro de la posición: el id no lleva reloj, así que ese
-                # intent no se libera solo y el stop-loss queda inutilizado. Hay que insistir
-                # en cada ciclo hasta que una persona lo resuelva.
+            if intent is not None and intent.status in (IntentStatus.SENT, IntentStatus.RESERVED):
+                # En una compra, bloquear el reintento evita un doble gasto. En una SALIDA te
+                # deja dentro de la posición: el id no lleva reloj, así que ese intent no se
+                # libera solo y el stop-loss queda inutilizado. Hay que insistir en cada ciclo
+                # hasta que una persona lo resuelva. RESERVED visto aquí nunca es normal: en
+                # un ciclo cada posición se procesa una vez, así que un ciclo anterior murió
+                # entre reservar y marcar SENT. Las demás (CONFIRMED) son una salida ya hecha.
+                if intent.status is IntentStatus.SENT:
+                    estado = (
+                        "quedó en estado incierto (SENT): puede haber llegado o no al mercado. "
+                        "Comprueba en el exchange si la venta se ejecutó y reconcilia la orden "
+                    )
+                else:
+                    estado = (
+                        "quedó RESERVED: el proceso murió antes de enviarla, así que NO salió "
+                        "al mercado. Libera o elimina el intent para que se reintente "
+                    )
                 msg = (
                     f"{position.id} ({position.symbol}): la orden de salida "
-                    f"{decision.reason.value} quedó en estado incierto (SENT) y la posición "
-                    "NO se puede cerrar automáticamente. Requiere atención manual: comprueba "
-                    "en el exchange si la venta se ejecutó y reconcilia la orden "
-                    f"{coid}."
+                    f"{decision.reason.value} {estado}{coid}; mientras tanto la posición "
+                    "NO se puede cerrar automáticamente. Requiere atención manual."
                 )
                 self._notify(msg, Level.CRITICAL)
                 raise ExitRefused(msg)

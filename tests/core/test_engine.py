@@ -588,16 +588,52 @@ def test_stuck_sent_exit_nags_critical_every_cycle_and_reports_errors(make_env):
     assert len(env.executor.orders) == 1  # y nunca se reenvió la orden
 
 
-def test_exit_duplicate_that_is_not_sent_stays_quiet(make_env):
+def test_exit_duplicate_that_is_confirmed_stays_quiet(make_env):
     # Un duplicado ya CONFIRMED no es una alarma: la posición ya se cerró por esa vía.
     from core.idempotency import exit_order_id
     env = make_env()
     p = open_pos(env, entry=100)
     env.data.price = Decimal("80")
     coid = exit_order_id(p.id, Side.SELL, ExitReason.STOP_LOSS)
-    env.repo.reserve_intent(coid, {}, NOW)  # RESERVED, no SENT
+    env.repo.reserve_intent(coid, {}, NOW)
+    env.repo.mark_intent_confirmed(coid, Fill("f1", coid, Market.CEX, "BTC/USDT", Side.SELL,
+                                              Decimal("80"), Decimal("1"), Decimal(0), NOW))
     r = env.engine.run_exit_cycle(NOW)
     assert r.errors == []
+    assert not [m for m, lvl in env.notifier.sent if lvl is Level.CRITICAL]
+
+
+def test_stuck_reserved_exit_nags_critical_every_cycle_and_says_it_never_left(make_env):
+    # Si el proceso muere entre reservar y marcar SENT, el intent queda RESERVED, el id sin
+    # reloj choca en cada reintento y la posición no se cierra nunca, sin aviso alguno.
+    from datetime import timedelta
+    from core.idempotency import exit_order_id
+    env = make_env()
+    p = open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    coid = exit_order_id(p.id, Side.SELL, ExitReason.STOP_LOSS)
+    env.repo.reserve_intent(coid, {}, NOW)  # simula la muerte antes de _mark_sent
+    for minute in (0, 1, 2):
+        env.notifier.sent.clear()
+        r = env.engine.run_exit_cycle(NOW + timedelta(minutes=minute))
+        assert r.closed == [] and len(r.errors) == 1
+        criticals = [m for m, lvl in env.notifier.sent if lvl is Level.CRITICAL]
+        assert len(criticals) == 1
+        assert "RESERVED" in criticals[0] and "NO salió" in criticals[0]
+        assert "SENT" not in criticals[0]
+    assert env.executor.orders == []
+
+
+def test_failed_exit_intent_is_retried_not_alerted(make_env):
+    from core.idempotency import exit_order_id
+    env = make_env()
+    p = open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    coid = exit_order_id(p.id, Side.SELL, ExitReason.STOP_LOSS)
+    env.repo.reserve_intent(coid, {}, NOW)
+    env.repo.mark_intent_failed(coid, "rechazada")
+    r = env.engine.run_exit_cycle(NOW)
+    assert len(r.closed) == 1 and r.errors == []
     assert not [m for m, lvl in env.notifier.sent if lvl is Level.CRITICAL]
 
 
@@ -657,3 +693,18 @@ def test_engine_notifications_carry_no_mode_prefix_of_their_own(make_env):
     env.engine.run_entry_cycle(FakeSource([sig("s2")]), NOW)
     assert env.notifier.sent
     assert not any(m.startswith("mode:") for m, _ in env.notifier.sent)
+
+
+def test_scheduled_stuck_reserved_exit_gives_one_critical_and_no_duplicate_summary(make_env):
+    # Los dos lados juntos: el motor real + el trabajo programado real. El resumen de la
+    # CLI no debe repetir lo que el motor ya avisó como CRITICAL.
+    import cli
+    from core.idempotency import exit_order_id
+    env = make_env()
+    p = open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    env.repo.reserve_intent(exit_order_id(p.id, Side.SELL, ExitReason.STOP_LOSS), {}, NOW)
+    _, exit_ = cli.build_jobs(env.engine, FakeSource([]), notifier=env.notifier)
+    env.notifier.sent.clear()
+    exit_()
+    assert [lvl for _, lvl in env.notifier.sent] == [Level.CRITICAL]
