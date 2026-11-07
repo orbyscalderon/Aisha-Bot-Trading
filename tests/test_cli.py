@@ -306,7 +306,7 @@ def test_no_warning_when_some_protection_is_on(paper_yaml, signals_csv, root):
     r = invoke(["run", "--config", str(paper_yaml), "--signals", str(signals_csv),
                 "--root", str(root), "--once"], CliDeps(data_source=FakeData(), notifier=notifier))
     assert "sin protecciones" not in r.output
-    assert not [m for m, lvl in notifier.sent if lvl is Level.WARNING]
+    assert not [m for m, lvl in notifier.sent if lvl is Level.WARNING and "protecciones" in m]
 
 
 def test_backtest_warns_when_protections_omitted(tmp_path, signals_csv, quotes_csv):
@@ -314,6 +314,31 @@ def test_backtest_warns_when_protections_omitted(tmp_path, signals_csv, quotes_c
     r = invoke(["backtest", "--config", str(p), "--signals", str(signals_csv), "--quotes", str(quotes_csv)])
     assert r.exit_code == 0, r.output
     assert "sin protecciones" in r.output
+
+
+# --- I1: copy_sell no está conectado en el plan 1 ---
+
+def test_run_warns_that_copy_sell_is_not_wired(paper_yaml, signals_csv, root):
+    notifier = RecordingNotifier()
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(signals_csv),
+                "--root", str(root), "--once"], CliDeps(data_source=FakeData(), notifier=notifier))
+    assert r.exit_code == 0, r.output
+    assert "copy_sell" in r.output and "stop-loss" in r.output and "time-stop" in r.output
+    assert [m for m, lvl in notifier.sent if lvl is Level.WARNING and "copy_sell" in m]
+
+
+def test_backtest_warns_that_copy_sell_is_not_wired(paper_yaml, signals_csv, quotes_csv):
+    r = invoke(["backtest", "--config", str(paper_yaml), "--signals", str(signals_csv),
+                "--quotes", str(quotes_csv)])
+    assert r.exit_code == 0, r.output
+    assert "copy_sell" in r.output
+
+
+def test_no_copy_sell_warning_for_other_primaries(tmp_path, signals_csv, root):
+    p = write_yaml(tmp_path / "tp.yaml", exits={"stop_loss_pct": 15, "primary": "time_stop"})
+    r = invoke(["run", "--config", str(p), "--signals", str(signals_csv),
+                "--root", str(root), "--once"])
+    assert "copy_sell" not in r.output
 
 
 # --- stop / status / positions ---

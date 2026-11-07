@@ -275,6 +275,19 @@ def warn_if_no_protections(config: BotConfig, notifier: Notifier) -> None:
     notifier.send(message, Level.WARNING)
 
 
+def warn_if_copy_sell_primary(config: BotConfig, notifier: Notifier) -> None:
+    """``primary: copy_sell`` no hace nada en el plan 1: que no parezca que sí."""
+    if config.exits.primary != "copy_sell":
+        return
+    message = (
+        "ATENCIÓN: exits.primary es copy_sell, pero copiar las ventas del trader NO está "
+        "conectado en el plan 1 (llega en un plan posterior): las salidas efectivas son "
+        "solo el stop-loss y el time-stop."
+    )
+    _say(config, message)
+    notifier.send(message, Level.WARNING)
+
+
 # --- lectura de ficheros de entrada del backtest ---
 
 def _parse_ts(text: str) -> datetime:
@@ -371,6 +384,7 @@ def run(
     except InvalidExchange as exc:
         raise _fail(str(exc), 2) from None
     warn_if_no_protections(cfg, notifier)
+    warn_if_copy_sell_primary(cfg, notifier)
     source = CexCsvSignalSource(signals)
     entry_job, exit_job = build_jobs(
         engine, source, notifier=notifier, audit=audit,
@@ -423,6 +437,7 @@ def backtest(
     end = max(q.timestamp for q in qs)
     notifier = deps.notifier if deps.notifier is not None else _make_notifier(cfg.mode)
     warn_if_no_protections(cfg, notifier)
+    warn_if_copy_sell_primary(cfg, notifier)
     _say(cfg, f"backtest {start.isoformat()} -> {end.isoformat()} (paso {step_minutes} min)")
     try:
         result = run_backtest(cfg, sigs, qs, start, end, timedelta(minutes=step_minutes), _parse_capital(capital))

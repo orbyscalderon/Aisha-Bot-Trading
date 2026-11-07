@@ -3,8 +3,9 @@
 #
 # Exposición máxima simultánea: 5 posiciones x 50 USD por token = 250 USD.
 # El bot se apaga solo al perder 50 USD en un día.
-# La salida primaria es copy_sell (copiar la salida del trader es el copy-trading);
-# el stop-loss del 15 % y el time-stop de 72 h son redes de seguridad, no la estrategia.
+# La salida primaria prevista es copy_sell (copiar la salida del trader es el copy-trading),
+# pero NO está conectada en el plan 1: hoy las salidas efectivas son solo el stop-loss
+# del 15 % y el time-stop de 72 h (el bot avisa de ello al arrancar).
 # El cooldown evita insistir: si un trader seguido entra y sale tres veces de un token que
 # se desploma, sin cooldown el bot copia las tres y pierde las tres. Las protecciones solo
 # bloquean entradas, nunca salidas.

@@ -16,7 +16,7 @@ dependencies = [
     "httpx>=0.27",
     # La API de apscheduler 4 es otra: el código usa la 3.x.
     "apscheduler>=3.10,<4",
-    "quantstats>=0.0.62",
+    "quantstats==0.0.86",
 ]
 
 [project.scripts]

@@ -48,7 +48,7 @@ Copia `config/config.example.yaml` a `config/config.yaml` y ajústalo. Las secci
 |---|---|
 | `mode` | `paper` (simulado). `live` existe en el esquema pero `run` lo rechaza. |
 | `sizing` | Cuánto invertir por señal: `flat` (importe fijo), `mirror` (porcentaje del trader con tope) o `risk` (porcentaje de riesgo con stop). |
-| `exits` | Stop-loss, take-profit, time-stop, trailing y la salida primaria (`copy_sell`, `take_profit` o `time_stop`). |
+| `exits` | Stop-loss, take-profit, time-stop, trailing y la salida primaria (`copy_sell`, `take_profit` o `time_stop`). **En el plan 1 `copy_sell` no está conectada**: las salidas efectivas son el stop-loss y el time-stop, y el bot lo avisa al arrancar. |
 | `risk` | Máximo por token, posiciones abiertas, gasto diario, pérdida diaria y techo duro por orden. |
 | `cadence` | `entry_cron` (cuándo se buscan entradas, UTC) y `exit_interval_seconds` (cada cuánto se vigilan las salidas). |
 | `protections` | `cooldown_minutes`, `stop_loss_streak`, `max_drawdown_pct`, `max_usd_per_group`. **Un 0 desactiva la protección.** |
