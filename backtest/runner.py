@@ -170,6 +170,9 @@ def run_backtest(
     for label, ts in (("start", start), ("end", end)):
         if ts.tzinfo is None or ts.utcoffset() is None:
             raise ValueError(f"{label} debe llevar zona horaria: {ts!r}")
+    # Todo el reloj simulado en UTC: el motor deriva de ``now`` el día UTC de los límites
+    # diarios, y un offset explícito del CSV no debe cambiar ese día.
+    start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
     if step <= timedelta(0):
         raise ValueError(f"step debe ser positivo: {step!r}")
     if end < start:

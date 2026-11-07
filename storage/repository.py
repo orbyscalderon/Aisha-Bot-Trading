@@ -275,6 +275,21 @@ class Repository:
             (IntentStatus.RESERVED, IntentStatus.SENT), error,
         )
 
+    def get_intent(self, client_order_id: str) -> OrderIntent | None:
+        """La intención con ese identificador, o None si nunca se reservó."""
+        r = self._conn.execute(
+            "SELECT * FROM order_intents WHERE client_order_id = ?", (client_order_id,)
+        ).fetchone()
+        if r is None:
+            return None
+        return OrderIntent(
+            client_order_id=r["client_order_id"],
+            status=IntentStatus(r["status"]),
+            payload=json.loads(r["payload"]),
+            created_at=_parse_ts(r["created_at"]),
+            error=r["error"],
+        )
+
     def unconfirmed_intents(self) -> list[OrderIntent]:
         """Intenciones RESERVED o SENT (resultado incierto), por antigüedad."""
         rows = self._conn.execute(

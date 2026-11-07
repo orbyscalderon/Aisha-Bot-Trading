@@ -41,7 +41,7 @@ from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 
 from core.config import BotConfig
-from core.idempotency import client_order_id, exit_order_id
+from core.idempotency import IntentStatus, client_order_id, exit_order_id
 from core.models import (
     Order, Position, Quote, RejectReason, Side, Signal,
 )
@@ -50,7 +50,7 @@ from core.rules.exits import evaluate_exit, next_peak_price
 from core.rules.protections import ProtectionState, evaluate_protections
 from core.rules.risk import RiskAction, build_risk_state, evaluate_risk
 from core.rules.sizing import SizingContext, apply_hard_cap, calculate_size
-from core.safety import CircuitBreaker, is_kill_switch_active, mode_prefix
+from core.safety import CircuitBreaker, is_kill_switch_active
 from core.signals import clamp_cursor, ensure_frozen_allowlist, filter_by_allowlist
 from ports.market import MarketDataSource, OrderExecutor, OrderRejected, QuoteUnavailable
 from ports.notifier import Level, Notifier
@@ -74,6 +74,10 @@ class EntryCycleResult:
 class ExitCycleResult:
     closed: list[Position] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+class ExitRefused(Exception):
+    """Salida que el motor se niega a ejecutar; la alerta CRITICAL ya se envió."""
 
 
 class Engine:
@@ -108,7 +112,9 @@ class Engine:
     # --- utilidades ---
 
     def _notify(self, message: str, level: Level) -> None:
-        self._notifier.send(f"{mode_prefix(self._cfg.mode)} | {message}", level)
+        # Sin prefijo de modo: lo antepone cada notificador (el puerto es la capa que no
+        # se puede saltar), y aquí duplicaría "mode: paper | ".
+        self._notifier.send(message, level)
 
     def _log(self, event: str, now: datetime, **payload: object) -> None:
         self._audit.record(event, payload, now)
@@ -144,7 +150,7 @@ class Engine:
             self._notify("circuit breaker abierto: entradas bloqueadas", Level.CRITICAL)
             return result
 
-        utc_day = now.date()  # una sola vez: un cambio de día a mitad no mueve la contabilidad
+        utc_day = now.astimezone(timezone.utc).date()  # una sola vez: un cambio de día a mitad no mueve la contabilidad
         try:
             halted, shutdown, last_seen = self._entry_body(source, now, utc_day, result)
             if shutdown:
@@ -375,6 +381,11 @@ class Engine:
                 continue
             try:
                 done = self._process_exit(position, quote, now)
+            except ExitRefused as exc:
+                # Ya se avisó con CRITICAL: solo queda constancia en el resultado y la auditoría.
+                errors.append(str(exc))
+                self._log("exit_error", now, position_id=position.id, error=str(exc))
+                continue
             except Exception as exc:  # noqa: BLE001 - una posición no aborta a las demás
                 msg = f"{position.id}: {exc!r}"
                 errors.append(msg)
@@ -396,11 +407,36 @@ class Engine:
         if decision is None:
             return None
 
+        if decision.fraction != 1:
+            # Nada sabe cerrar parcialmente: vender todo cuando se pidió una fracción sería
+            # un exceso de venta silencioso. Se niega, en voz alta, antes de reservar nada.
+            msg = (
+                f"{position.id}: salida parcial {decision.reason.value} (fracción "
+                f"{decision.fraction}) no soportada; no se vende nada"
+            )
+            self._notify(msg, Level.CRITICAL)
+            raise ExitRefused(msg)
+
         coid = exit_order_id(position.id, Side.SELL, decision.reason)
         if not self._repo.reserve_intent(
             coid, {"position_id": position.id, "reason": decision.reason.value}, now
         ):
             self._log("exit_duplicate", now, position_id=position.id, client_order_id=coid)
+            intent = self._repo.get_intent(coid)
+            if intent is not None and intent.status is IntentStatus.SENT:
+                # En una compra, SENT bloqueando el reintento evita un doble gasto. En una
+                # SALIDA te deja dentro de la posición: el id no lleva reloj, así que ese
+                # intent no se libera solo y el stop-loss queda inutilizado. Hay que insistir
+                # en cada ciclo hasta que una persona lo resuelva.
+                msg = (
+                    f"{position.id} ({position.symbol}): la orden de salida "
+                    f"{decision.reason.value} quedó en estado incierto (SENT) y la posición "
+                    "NO se puede cerrar automáticamente. Requiere atención manual: comprueba "
+                    "en el exchange si la venta se ejecutó y reconcilia la orden "
+                    f"{coid}."
+                )
+                self._notify(msg, Level.CRITICAL)
+                raise ExitRefused(msg)
             return None
         self._log("exit_reserved", now, position_id=position.id, client_order_id=coid,
                   reason=decision.reason.value)

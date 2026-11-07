@@ -253,3 +253,30 @@ def test_balance_raises_when_an_open_position_has_no_quote():
         src.get_balance()
     conn.close()
 
+
+
+def test_backtest_with_explicit_offsets_matches_the_utc_equivalent():
+    # C2: un +02:00 explícito en el CSV movía todo el reloj simulado a una fecha local y
+    # los límites diarios se leían de la ventana equivocada.
+    from datetime import date
+    plus2 = timezone(timedelta(hours=2))
+    t0 = datetime(2026, 3, 2, 1, 0, tzinfo=plus2)  # = 2026-03-01T23:00Z
+    base = cfg(stop_loss_pct=20)
+    base = BotConfig.model_validate({
+        **base.model_dump(mode="json"),
+        "risk": {"max_usd_per_token": 1000, "max_open_positions": 5, "max_usd_per_day": 150,
+                 "max_daily_loss_usd": 500, "hard_max_order_usd": 1000},
+    })
+
+    def run(tz):
+        t = t0.astimezone(tz)
+        sigs = [sig_at(t, "s1", "AAA/USDT"), sig_at(t, "s2", "BBB/USDT")]
+        qs = [Quote(s, Decimal(100), t + i * STEP) for s in ("AAA/USDT", "BBB/USDT") for i in range(3)]
+        return run_backtest(base, sigs, qs, t, t + 2 * STEP, STEP)
+
+    local, utc = run(plus2), run(UTC)
+    assert len(utc.positions) == 1  # el tope diario (150) deja pasar solo una de dos
+    assert len(local.positions) == len(utc.positions)
+    key = lambda r: [(f.symbol, f.side, f.price, f.quantity, f.timestamp) for f in r.fills]  # noqa: E731
+    assert key(local) == key(utc)
+    assert local.metrics == utc.metrics

@@ -66,6 +66,7 @@ class FakeExecutor(OrderExecutor):
     def __init__(self, fail=None, price_factor=Decimal("1.01")):
         self.fail = fail
         self.price_factor = price_factor
+        self.fill_time = NOW
         self.orders = []
 
     def submit_buy(self, order):
@@ -75,7 +76,7 @@ class FakeExecutor(OrderExecutor):
         price = order.reference_price * self.price_factor
         qty = (order.amount_usd / price).quantize(Decimal("0.00000001"))
         return Fill(f"f-{order.client_order_id}", order.client_order_id, order.market,
-                    order.symbol, Side.BUY, price, qty, Decimal("0.1"), NOW)
+                    order.symbol, Side.BUY, price, qty, Decimal("0.1"), self.fill_time)
 
     def submit_sell(self, order):
         self.orders.append(order)
@@ -83,7 +84,7 @@ class FakeExecutor(OrderExecutor):
             raise self.fail
         return Fill(f"f-{order.client_order_id}", order.client_order_id, order.market,
                     order.symbol, Side.SELL, order.reference_price, order.quantity,
-                    Decimal("0.1"), NOW, position_id=order.position_id)
+                    Decimal("0.1"), self.fill_time, position_id=order.position_id)
 
 
 class FakeNotifier(Notifier):
@@ -562,3 +563,86 @@ def test_ambiguous_exit_failure_stays_sent_and_is_not_retried(make_env):
     env.executor.fail = None
     r2 = env.engine.run_exit_cycle(NOW + timedelta(minutes=1))
     assert r2.closed == [] and len(env.executor.orders) == 1
+
+
+# --- revisión final: C1, C2, I2 ---
+
+def test_stuck_sent_exit_nags_critical_every_cycle_and_reports_errors(make_env):
+    # C1: un fallo ambiguo en una VENTA deja el intent en SENT; el reintento lo bloquea.
+    # Eso en una compra evita el doble gasto; en una salida deja al usuario encerrado.
+    from datetime import timedelta
+    env = make_env(executor=FakeExecutor(fail=TimeoutError("sin respuesta")))
+    open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    r1 = env.engine.run_exit_cycle(NOW)
+    assert len(r1.errors) == 1
+    env.executor.fail = None  # el exchange vuelve
+    env.notifier.sent.clear()
+    for minute in (1, 2, 3):
+        env.notifier.sent.clear()
+        r = env.engine.run_exit_cycle(NOW + timedelta(minutes=minute))
+        assert r.closed == [] and len(r.errors) == 1
+        criticals = [m for m, lvl in env.notifier.sent if lvl is Level.CRITICAL]
+        assert len(criticals) == 1  # se repite en CADA ciclo, no una sola vez
+        assert "manual" in criticals[0] and "p1" in criticals[0]
+    assert len(env.executor.orders) == 1  # y nunca se reenvió la orden
+
+
+def test_exit_duplicate_that_is_not_sent_stays_quiet(make_env):
+    # Un duplicado ya CONFIRMED no es una alarma: la posición ya se cerró por esa vía.
+    from core.idempotency import exit_order_id
+    env = make_env()
+    p = open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    coid = exit_order_id(p.id, Side.SELL, ExitReason.STOP_LOSS)
+    env.repo.reserve_intent(coid, {}, NOW)  # RESERVED, no SENT
+    r = env.engine.run_exit_cycle(NOW)
+    assert r.errors == []
+    assert not [m for m, lvl in env.notifier.sent if lvl is Level.CRITICAL]
+
+
+def test_partial_exit_fraction_is_refused_loudly(make_env, monkeypatch):
+    # I2: nada sabe cerrar parcialmente; vender todo cuando se pidió la mitad sería un
+    # exceso de venta silencioso.
+    import core.engine as engine_mod
+    from core.rules.exits import ExitDecision
+    env = make_env()
+    open_pos(env, entry=100)
+    monkeypatch.setattr(
+        engine_mod, "evaluate_exit",
+        lambda *a, **k: ExitDecision(ExitReason.COPY_SELL, Decimal("0.5")),
+    )
+    r = env.engine.run_exit_cycle(NOW)
+    assert r.closed == [] and len(r.errors) == 1 and "0.5" in r.errors[0]
+    assert env.executor.orders == []
+    assert env.repo.unconfirmed_intents() == []  # ni siquiera se reservó
+    assert [m for m, lvl in env.notifier.sent if lvl is Level.CRITICAL]
+
+
+def test_utc_day_is_the_true_utc_date_for_non_utc_now(make_env):
+    # C2: 01:00+02:00 del 2 de marzo es el 1 de marzo en UTC. Con la fecha local, la
+    # ventana consultada ([2 mar 00:00Z, 3 mar)) no contiene a "now" y los límites
+    # diarios se leían como cero.
+    from datetime import timedelta
+    tz = timezone(timedelta(hours=2))
+    now = datetime(2026, 3, 2, 1, 0, tzinfo=tz)  # = 2026-03-01T23:00Z
+    cfg = make_cfg(risk={"max_usd_per_day": 150, "max_usd_per_token": 1000})
+    env = make_env(cfg=cfg)
+    env.executor.fill_time = now
+    r1 = env.engine.run_entry_cycle(FakeSource([sig("s1", symbol="AAA/USDT", ts=now)]), now)
+    assert len(r1.opened) == 1
+    r2 = env.engine.run_entry_cycle(FakeSource([sig("s2", symbol="BBB/USDT", ts=now)]), now)
+    assert r2.opened == [] and r2.rejected[0][1] is RejectReason.MAX_USD_PER_DAY
+
+
+def test_fill_in_last_microsecond_of_utc_day_counts_for_that_day(make_env):
+    # Frontera de día (aplazada de la tarea 6): el último microsegundo es del día que acaba.
+    from datetime import date
+    last = datetime(2026, 3, 1, 23, 59, 59, 999999, tzinfo=UTC)
+    env = make_env()
+    p = Portfolio(env.repo)
+    pos = open_pos(env)
+    env.repo.save_fill(Fill("f1", "c1", Market.CEX, "BTC/USDT", Side.BUY, Decimal("100"),
+                            Decimal("1"), Decimal(0), last))
+    assert p.spent_usd(date(2026, 3, 1)) == Decimal("100")
+    assert p.spent_usd(date(2026, 3, 2)) == Decimal(0)
