@@ -121,7 +121,10 @@ class CexDataSource(MarketDataSource):
 
     def _last_price(self, symbol: str) -> Decimal:
         ticker = self._call(self._client.fetch_ticker, symbol)
-        raw = ticker.get("last") if isinstance(ticker, dict) else None
+        if not isinstance(ticker, dict):
+            # Respuesta ilegible (no es "este mercado no tiene precio"): transitoria.
+            raise QuoteUnavailable(f"respuesta de ticker ilegible para {symbol}: {ticker!r}")
+        raw = ticker.get("last")
         if raw is None:
             raise _NoPrice(f"sin precio para {symbol}")
         price = _to_decimal(raw, f"precio de {symbol}")
@@ -170,7 +173,7 @@ class CexDataSource(MarketDataSource):
     def _asset_price(self, asset: str) -> Decimal | None:
         """Precio en USD del activo, o None si no tiene mercado.
 
-        Se omite con un WARNING (una vez por activo) el activo que no se puede
+        Se omite con un WARNING (una vez por proceso y activo) el activo que no se puede
         valorar de forma persistente: sin mercado (BadSymbol o símbolo ausente
         de client.markets) o con el par listado pero sin precio (last nulo o no
         positivo). El bot solo opera símbolos que sabe cotizar, así que ese

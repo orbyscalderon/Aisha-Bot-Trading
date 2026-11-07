@@ -317,3 +317,11 @@ def test_keyboard_interrupt_is_not_swallowed():
     client = FakeCcxt(fail_times=99, error=KeyboardInterrupt)
     with pytest.raises(KeyboardInterrupt):
         source(client).get_quote("X/USDT")
+
+
+@pytest.mark.parametrize("ticker", [None, "oops", []])
+def test_get_balance_unreadable_ticker_response_still_raises(ticker):
+    balance = {"total": {"USDT": 10, "BTC": 1}}
+    client = FakeCcxt(balance=balance, markets={"BTC/USDT": {}}, tickers={"BTC/USDT": ticker})
+    with pytest.raises(QuoteUnavailable):
+        source(client).get_balance()
