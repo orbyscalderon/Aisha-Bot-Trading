@@ -6,7 +6,7 @@ Copia las compras de traders que sigues, con límites de riesgo estrictos, y te 
 > **ADVERTENCIA: el modo real NO existe todavía.**
 > Este bot no envía órdenes reales a ningún exchange. Solo hace backtest y ejecución
 > **simulada** (paper). Con `mode: live`, `run` se niega a arrancar y termina con error:
-> la ejecución real llega en el plan 3. No hay ninguna forma de que este código mueva dinero.
+> la ejecución real es una fase posterior del desarrollo (el "plan 3" del plan de trabajo interno), que se construye a propósito después de probar bien el resto. No hay ninguna forma de que este código mueva dinero.
 
 ## Qué hace y qué no hace
 
@@ -104,6 +104,11 @@ timestamp,symbol,price
 2026-01-01T10:00:00+00:00,BTC/USDT,100
 ```
 
+Las cotizaciones las tienes que aportar tú: el bot no las descarga. Una forma sencilla es
+exportar velas históricas del exchange (por ejemplo con `ccxt`: `exchange.fetch_ohlcv(symbol,
+'1h')`, usando el cierre de cada vela como `price`) o bajarlas de la web del exchange y
+convertirlas a ese formato. Cuanto más fino el intervalo, más fiel el stop-loss simulado.
+
 Las fechas sin zona horaria se interpretan como UTC. El backtest simula un solo mercado
 por ejecución.
 
@@ -118,6 +123,20 @@ variables de entorno `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`. Todo mensaje emp
 1. Copia y ajusta `config/config.example.yaml`.
 2. Prepara los dos CSV de arriba con tus señales y las cotizaciones del periodo.
 3. `copybot backtest --config config/config.yaml --signals senales.csv --quotes cotizaciones.csv --report informe.html`
+
+### Ejemplo de salida de `backtest`
+
+```
+mode: paper | backtest 2026-01-01T10:00:00+00:00 -> 2026-01-01T13:00:00+00:00 (paso 60 min)
+mode: paper | PnL realizado: -30.0 USD | drawdown máx.: 30.0 USD
+mode: paper | tasa de acierto: 0 | expectativa: -30.0 USD | Sharpe: 0
+mode: paper | cierres por motivo:
+  STOP_LOSS: 1
+mode: paper | Posiciones abiertas al final: 0   (PnL latente: 0.00 USD)
+```
+
+(Las cifras son ilustrativas.) Mira siempre la línea de posiciones abiertas: las métricas
+solo cuentan lo cerrado, y unas pérdidas latentes grandes no aparecerían en ellas.
 
 ## Tests
 

@@ -548,3 +548,146 @@ def test_run_unknown_exchange_is_a_message(paper_yaml, signals_csv, root):
     r = invoke(["run", "--config", str(paper_yaml), "--signals", str(signals_csv), "--root", str(root),
                 "--once", "--exchange", "noexiste"], CliDeps())
     assert r.exit_code != 0 and "Traceback" not in r.output and "noexiste" in r.output
+
+
+# --- ronda de correcciones ---
+
+def test_critical_alert_is_sent_even_if_audit_write_fails():
+    release, started = threading.Event(), threading.Event()
+
+    class HungEntry:
+        def run_entry_cycle(self, source, now):
+            started.set()
+            release.wait(5)
+
+        def run_exit_cycle(self, now):
+            raise AssertionError("no debe ejecutarse sin cerrojo")
+
+    class BrokenAudit:
+        def record(self, event, payload, now=None):
+            raise RuntimeError("database is locked")
+
+    notifier = RecordingNotifier()
+    entry, exit_ = cli.build_jobs(HungEntry(), object(), notifier=notifier,
+                                  audit=BrokenAudit(), lock_timeout=0.1)
+    t = threading.Thread(target=entry)
+    t.start()
+    assert started.wait(2)
+    try:
+        exit_()  # la auditoría rota no puede propagarse
+    finally:
+        release.set()
+        t.join()
+    assert [lvl for _, lvl in notifier.sent] == [Level.CRITICAL]
+
+
+def test_critical_alert_is_sent_before_the_audit_write():
+    order = []
+    release, started = threading.Event(), threading.Event()
+
+    class HungEntry:
+        def run_entry_cycle(self, source, now):
+            started.set()
+            release.wait(5)
+
+    class Audit:
+        def record(self, event, payload, now=None):
+            order.append("audit")
+
+    class Notif(Notifier):
+        def send(self, message, level):
+            order.append("notify")
+
+    entry, exit_ = cli.build_jobs(HungEntry(), object(), notifier=Notif(), audit=Audit(), lock_timeout=0.1)
+    t = threading.Thread(target=entry)
+    t.start()
+    assert started.wait(2)
+    try:
+        exit_()
+    finally:
+        release.set()
+        t.join()
+    assert order == ["notify", "audit"]
+
+
+def test_lock_is_released_if_exit_cycle_raises():
+    class Eng:
+        def __init__(self):
+            self.n = 0
+
+        def run_exit_cycle(self, now):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("boom")
+
+    eng = Eng()
+    notifier = RecordingNotifier()
+    _, exit_ = cli.build_jobs(eng, object(), notifier=notifier, lock_timeout=0.1)
+    with pytest.raises(RuntimeError):
+        exit_()
+    exit_()  # si el cerrojo siguiera retenido, esto avisaría y no ejecutaría
+    assert eng.n == 2 and notifier.sent == []
+
+
+def test_lock_timeout_is_bounded_relative_to_interval():
+    for interval in (60, 600):
+        t = cli.exit_lock_timeout(interval)
+        assert interval < t <= 5 * interval
+
+
+def test_run_wires_audit_and_configured_lock_timeout(tmp_path, signals_csv, root, monkeypatch):
+    seen = {}
+    real = cli.build_jobs
+
+    def spy(engine, source, **kwargs):
+        seen.update(kwargs)
+        return real(engine, source, **kwargs)
+
+    monkeypatch.setattr(cli, "build_jobs", spy)
+    p = write_yaml(tmp_path / "c120.yaml", cadence={"entry_cron": "0 * * * *", "exit_interval_seconds": 120})
+    invoke(["run", "--config", str(p), "--signals", str(signals_csv), "--root", str(root)],
+           CliDeps(scheduler=FakeScheduler(), data_source=FakeData()))
+    assert seen["audit"] is not None
+    assert hasattr(seen["audit"], "record")
+    assert seen["lock_timeout"] == cli.exit_lock_timeout(120)
+
+
+def test_unknown_exchange_creates_no_database(paper_yaml, signals_csv, root):
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(signals_csv), "--root", str(root),
+                "--once", "--exchange", "noexiste"], CliDeps())
+    assert r.exit_code != 0
+    assert not list(root.glob("*.db"))
+
+
+def test_unrelated_value_error_is_not_disguised_as_bad_exchange(paper_yaml, signals_csv, root, monkeypatch):
+    def boom(*a, **k):
+        raise ValueError("fallo interno")
+
+    monkeypatch.setattr(cli, "init_db", boom)
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(signals_csv), "--root", str(root),
+                "--once"])
+    assert "exchange no válido" not in r.output
+    assert isinstance(r.exception, ValueError)
+
+
+def test_run_truncated_signal_row_is_a_message(paper_yaml, tmp_path, root):
+    bad = tmp_path / "trunc.csv"
+    bad.write_text(
+        "timestamp,trader_id,symbol,side,amount_usd\n"
+        f"{T0.isoformat()},t1,BTC/USDT\n",
+        encoding="utf-8",
+    )
+    r = invoke(["run", "--config", str(paper_yaml), "--signals", str(bad), "--root", str(root), "--once"])
+    assert r.exit_code != 0 and "Traceback" not in r.output and "trunc.csv" in r.output
+    assert not isinstance(r.exception, AttributeError)
+
+
+def test_backtest_truncated_signal_row_is_a_message(paper_yaml, quotes_csv, tmp_path):
+    bad = tmp_path / "trunc.csv"
+    bad.write_text(
+        "timestamp,trader_id,symbol,side,amount_usd\n"
+        f"{T0.isoformat()},t1,BTC/USDT\n",
+        encoding="utf-8",
+    )
+    r = invoke(["backtest", "--config", str(paper_yaml), "--signals", str(bad), "--quotes", str(quotes_csv)])
+    assert r.exit_code != 0 and not isinstance(r.exception, AttributeError)

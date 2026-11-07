@@ -18,6 +18,7 @@ Reglas de este módulo:
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import threading
 from collections.abc import Callable
@@ -48,6 +49,8 @@ from storage.audit import AuditLog
 from storage.db import init_db
 from storage.repository import Repository
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_CONFIG = Path("config/config.yaml")
 DEFAULT_CAPITAL = Decimal(10000)
 DEFAULT_EXCHANGE = "binance"
@@ -58,6 +61,10 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+class InvalidExchange(Exception):
+    """El exchange pedido no existe en ccxt (única causa esperada de fallo al construir la fuente)."""
 
 
 class LiveModeNotImplemented(RuntimeError):
@@ -121,19 +128,28 @@ def _build(
     data_source: MarketDataSource | None = None,
     notifier: Notifier | None = None,
     paper_capital: Decimal = DEFAULT_CAPITAL,
-) -> tuple[Engine, Notifier]:
+) -> tuple[Engine, Notifier, AuditLog]:
     if config.mode is Mode.LIVE:
         raise LiveModeNotImplemented(
             "modo live no implementado: la ejecución real llega en el plan 3"
         )
+    # La fuente de datos va ANTES de tocar el disco: un exchange inválido no deja una base
+    # de datos creada ni una conexión colgando. Solo se captura el error esperado.
+    if data_source is not None:
+        raw_data = data_source
+    else:
+        try:
+            raw_data = CexDataSource(exchange_id, ignore_assets=config.cex.ignore_assets)
+        except ValueError as exc:
+            raise InvalidExchange(f"exchange no válido {exchange_id!r}: {exc}") from exc
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     # Una base por modo: las posiciones simuladas nunca se mezclan con las reales.
     # check_same_thread=False porque los ciclos corren en hilos del planificador; el
-    # acceso está serializado por el cerrojo de ``build_jobs``.
-    conn = init_db(root / f"{config.mode.value}.db", check_same_thread=False)
+    # acceso del motor está serializado por el cerrojo de ``build_jobs``.
+    db_path = root / f"{config.mode.value}.db"
+    conn = init_db(db_path, check_same_thread=False)
     repo = Repository(conn)
-    raw_data = data_source if data_source is not None else CexDataSource(exchange_id, ignore_assets=config.cex.ignore_assets)
     data = PaperCapitalSource(raw_data, repo, paper_capital)
     exec_cfg = config.execution[Market.CEX]
     executor = PaperExecutor(
@@ -145,7 +161,11 @@ def _build(
         data_source=data, executor=executor, notifier=notifier,
         circuit_breaker=CircuitBreaker(3), project_root=root,
     )
-    return engine, notifier
+    # Auditoría para la alerta de cerrojo vencido: conexión PROPIA, porque la del motor puede
+    # estar a mitad de una transacción en el hilo de entrada colgado, y escribir en ella
+    # sin el cerrojo podría mezclarse con esa transacción.
+    side_audit = AuditLog(init_db(db_path, check_same_thread=False))
+    return engine, notifier, side_audit
 
 
 def build_engine(config: BotConfig, root: Path, **kwargs: Any) -> Engine:
@@ -200,10 +220,19 @@ def build_jobs(
                 f"{timeout:g} s ocupando el cerrojo. Las posiciones abiertas están "
                 "sin vigilar hasta que se libere."
             )
-            if audit is not None:
-                audit.record("exit_cycle_skipped_lock_timeout", {"timeout_seconds": str(timeout)})
+            # Primero la alerta: el notificador se traga sus propios errores, así que sale
+            # pase lo que pase. La auditoría es una escritura real y puede fallar.
             if notifier is not None:
                 notifier.send(message, Level.CRITICAL)
+            if audit is not None:
+                try:
+                    audit.record(
+                        "exit_cycle_skipped_lock_timeout",
+                        {"timeout_seconds": str(timeout)},
+                        datetime.now(timezone.utc),
+                    )
+                except Exception as exc:  # noqa: BLE001 - no puede tapar la alerta ya enviada
+                    logger.error("no se pudo auditar el ciclo de salida omitido: %s", type(exc).__name__)
             return
         try:
             engine.run_exit_cycle(datetime.now(timezone.utc))
@@ -266,6 +295,12 @@ def _parse_ts(text: str) -> datetime:
 def _read_signals(path: Path) -> list:
     try:
         return CexCsvSignalSource(path).fetch_trades(None)
+    except AttributeError:
+        # Fila truncada: el campo ausente llega como None y falla al limpiarlo.
+        raise _fail(
+            f"error leyendo las señales {path}: hay una fila incompleta o truncada "
+            "(se esperan las columnas timestamp,trader_id,symbol,side,amount_usd)"
+        ) from None
     except (OSError, KeyError, ValueError, InvalidOperation) as exc:
         raise _fail(f"error leyendo las señales {path}: {type(exc).__name__}: {exc}") from None
 
@@ -339,16 +374,16 @@ def run(
 
     _say(cfg, f"arrancando en simulado (config {cfg.fingerprint()[:12]})")
     try:
-        engine, notifier = _build(
+        engine, notifier, audit = _build(
             cfg, root, exchange_id=exchange, data_source=deps.data_source,
             notifier=deps.notifier, paper_capital=_parse_capital(capital),
         )
-    except (ValueError, AttributeError) as exc:
-        raise _fail(f"exchange no válido {exchange!r}: {type(exc).__name__}: {exc}", 2) from None
+    except InvalidExchange as exc:
+        raise _fail(str(exc), 2) from None
     warn_if_no_protections(cfg, notifier)
     source = CexCsvSignalSource(signals)
     entry_job, exit_job = build_jobs(
-        engine, source, notifier=notifier, audit=getattr(engine, "_audit", None),
+        engine, source, notifier=notifier, audit=audit,
         lock_timeout=exit_lock_timeout(cfg.cadence.exit_interval_seconds),
     )
 
