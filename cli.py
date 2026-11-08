@@ -645,7 +645,7 @@ def fetch_solana_signals(
     root: Path = RootOpt,
     wallet: list[str] = typer.Option(..., "--wallet", "-w", help="Wallet de Solana a seguir (repetible)."),
     since: str = typer.Option(..., "--since", help="Inicio ISO-8601 con zona horaria."),
-    out: Path = typer.Option(..., "--out", help="CSV de salida: timestamp,trader_id,symbol,side,amount_usd."),
+    out: Path = typer.Option(..., "--out", help="CSV de salida: timestamp,trader_id,symbol,side,amount_usd,signature."),
     token_map: Path | None = typer.Option(
         None, "--token-map", help="YAML/JSON opcional con 'mint: SÍMBOLO' para los tokens que sigues."
     ),
@@ -677,6 +677,7 @@ def fetch_solana_signals(
 
     signals: list = []
     omitted: dict[str, int] = {}
+    signatures: dict[str, str] = {}
     problems = 0
     for address in wallets:
         try:
@@ -690,6 +691,7 @@ def fetch_solana_signals(
             _say(cfg, f"{address}: lectura incompleta, se alcanzó el tope de peticiones; el historial termina antes de lo pedido")
         _say(cfg, f"{address}: {len(scan.signals)} señales")
         signals.extend(scan.signals)
+        signatures.update(scan.signatures)
         for reason, n in scan.omitted.items():
             omitted[reason] = omitted.get(reason, 0) + n
 
@@ -702,7 +704,7 @@ def fetch_solana_signals(
         raise _fail(f"{mode_prefix(cfg.mode)} | no hay ninguna señal que escribir; no se escribe {out}")
     signals.sort(key=lambda s: (s.timestamp, s.id))
     try:
-        write_signals_csv(out, signals)
+        write_signals_csv(out, signals, signatures)
     except HeliusError as exc:
         raise _fail(f"{mode_prefix(cfg.mode)} | {exc}") from None
     _say(cfg, f"{len(signals)} señales escritas en {out}")

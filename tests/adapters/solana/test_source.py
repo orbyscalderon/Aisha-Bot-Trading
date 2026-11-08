@@ -463,8 +463,8 @@ def test_csv_is_readable_by_the_backtest_reader(tmp_path):
     out = tmp_path / "sub" / "signals.csv"
     write_signals_csv(out, signals)
     lines = out.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "timestamp,trader_id,symbol,side,amount_usd"
-    assert lines[1].split(",")[1:] == [WALLET, f"{BONK}/USDC", "buy", "250"]
+    assert lines[0] == "timestamp,trader_id,symbol,side,amount_usd,signature"
+    assert lines[1].split(",")[1:] == [WALLET, f"{BONK}/USDC", "buy", "250", ""]
     assert lines[1].startswith(datetime.fromtimestamp(T0, tz=timezone.utc).isoformat())
     back = CexCsvSignalSource(out).fetch_trades(None)
     assert [(s.side, s.trader_amount_usd, s.symbol) for s in back] == [

@@ -54,6 +54,8 @@ def test_writes_a_csv_the_backtest_can_read(cfg_path, tmp_path):
     assert [s.side.value for s in signals] == ["buy", "sell"]
     assert signals[0].trader_id == WALLET
     assert "2 señales" in r.output
+    rows = out.read_text(encoding="utf-8").splitlines()
+    assert rows[0].endswith(",signature") and rows[1].endswith(",s1") and rows[2].endswith(",s2")
     assert KEY not in r.output
 
 

@@ -76,11 +76,11 @@ import httpx
 import yaml
 
 from core.models import Market, Side, Signal
-from ports.signal_source import SignalSource
+from ports.signal_source import SignalSource, signature_signal_id
 
 BASE_URL = "https://api.helius.xyz"
 ENV_VAR = "HELIUS_API_KEY"
-CSV_HEADER = ("timestamp", "trader_id", "symbol", "side", "amount_usd")
+CSV_HEADER = ("timestamp", "trader_id", "symbol", "side", "amount_usd", "signature")
 DEFAULT_PAGE_LIMIT = 100  # máximo que admite Helius por página
 DEFAULT_MAX_REQUESTS = 200
 DEFAULT_PAUSE_SECONDS = 0.2
@@ -321,7 +321,7 @@ def _wallet_side(
 
 def make_signal_id(signature: str, wallet: str) -> str:
     """Id estable de la señal: solo depende de la firma y de la wallet seguida."""
-    return hashlib.sha256(f"solana\x1f{signature}\x1f{wallet}".encode("utf-8")).hexdigest()[:32]
+    return signature_signal_id(signature, wallet)
 
 
 def parse_swap(
@@ -388,6 +388,7 @@ def parse_swap(
 class SwapScan:
     signals: list[Signal] = field(default_factory=list)
     omitted: dict[str, int] = field(default_factory=dict)
+    signatures: dict[str, str] = field(default_factory=dict)  # id de la señal -> firma
     requests: int = 0
     stop: str = ""  # empty | no_advance | since | max_requests
 
@@ -505,6 +506,7 @@ def fetch_wallet_swaps(
                 scan.omitted[result] = scan.omitted.get(result, 0) + 1
             else:
                 scan.signals.append(result)
+                scan.signatures[result.id] = sig
         if since is not None and min(h[1] for h in headers) < since:
             scan.stop = "since"
             break
@@ -538,17 +540,20 @@ class SolanaWalletSignalSource(SignalSource):
         self._max_requests = max_requests
         self.last_omitted: dict[str, int] = {}
         self.last_complete = True
+        self.last_signatures: dict[str, str] = {}
 
     def fetch_trades(self, since: datetime | None) -> list[Signal]:
         signals: list[Signal] = []
         self.last_omitted = {}
         self.last_complete = True
+        self.last_signatures = {}
         for wallet in self._wallets:
             scan = fetch_wallet_swaps(
                 self._client, wallet, self._api_key, since=since, token_map=self._token_map,
                 sleep=self._sleep, page_limit=self._page_limit, max_requests=self._max_requests,
             )
             signals.extend(scan.signals)
+            self.last_signatures.update(scan.signatures)
             self.last_complete = self.last_complete and scan.complete
             for reason, n in scan.omitted.items():
                 self.last_omitted[reason] = self.last_omitted.get(reason, 0) + n
@@ -560,8 +565,14 @@ class SolanaWalletSignalSource(SignalSource):
         return sorted(self._wallets)
 
 
-def write_signals_csv(path: Path, signals: list[Signal]) -> None:
-    """Escribe ``timestamp,trader_id,symbol,side,amount_usd`` de forma atómica."""
+def write_signals_csv(
+    path: Path, signals: list[Signal], signatures: Mapping[str, str] | None = None
+) -> None:
+    """Escribe ``timestamp,trader_id,symbol,side,amount_usd,signature`` de forma atómica.
+
+    ``signatures`` (id de señal -> firma) rellena la sexta columna; el lector de CSV del backtest
+    deriva de ella el id, que así coincide con el de la señal en vivo.
+    """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     try:
@@ -574,6 +585,7 @@ def write_signals_csv(path: Path, signals: list[Signal]) -> None:
                 writer.writerow([
                     s.timestamp.astimezone(timezone.utc).isoformat(), s.trader_id, s.symbol, s.side.value,
                     "" if amount is None else format(amount.normalize(), "f"),
+                    (signatures or {}).get(s.id, ""),
                 ])
         os.replace(tmp, path)
     except OSError as exc:
