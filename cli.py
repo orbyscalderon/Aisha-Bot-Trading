@@ -21,6 +21,7 @@ import csv
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,7 +34,28 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from adapters.cex.history import (
+    DEFAULT_MAX_REQUESTS,
+    DEFAULT_PAGE_LIMIT,
+    HistoryError,
+    SymbolNotFound,
+    fetch_candles,
+    make_client as make_history_client,
+    validate_timeframe,
+    write_quotes_csv,
+)
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
+from adapters.solana.source import (
+    OMISSION_REASONS,
+    HeliusError,
+    HeliusOrderError,
+    fetch_wallet_swaps,
+    load_api_key,
+    load_token_map,
+    make_client as make_solana_client,
+    validate_wallet,
+    write_signals_csv,
+)
 from adapters.notify.console import ConsoleNotifier
 from adapters.notify.telegram import TelegramNotifier
 from adapters.paper.executor import PaperExecutor
@@ -54,6 +76,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = Path("config/config.yaml")
 DEFAULT_CAPITAL = Decimal(10000)
 DEFAULT_EXCHANGE = "binance"
+FETCH_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
+FETCH_MAX_REQUESTS = DEFAULT_MAX_REQUESTS
 _PROTECTION_FIELDS = ("cooldown_minutes", "stop_loss_streak", "max_drawdown_pct", "max_usd_per_group")
 
 app = typer.Typer(
@@ -78,6 +102,10 @@ class CliDeps:
     scheduler: Any = None
     data_source: MarketDataSource | None = None
     notifier: Notifier | None = None
+    history_client: Any = None  # cliente ccxt de fetch-quotes
+    sleep: Callable[[float], None] | None = None  # temporizador de fetch-quotes
+    now: Callable[[], datetime] | None = None  # reloj de fetch-quotes y fetch-solana-signals
+    solana_client: Any = None  # cliente httpx de fetch-solana-signals
 
 
 # --- composición ---
@@ -507,6 +535,190 @@ def backtest(
         except (OSError, ValueError) as exc:
             raise _fail(f"no se pudo escribir el informe {report}: {exc}") from None
         _say(cfg, f"informe escrito en {report}")
+
+
+def _parse_aware(text: str, option: str) -> datetime:
+    try:
+        moment = datetime.fromisoformat(text.strip())
+    except ValueError:
+        raise _fail(f"{option} no es una fecha ISO-8601: {text!r}", 2) from None
+    if moment.tzinfo is None:
+        # Sin zona horaria no hay forma de saber qué instante se pidió: no se adivina.
+        raise _fail(
+            f"{option} debe llevar zona horaria (p. ej. 2026-11-01T00:00:00+00:00): {text!r}", 2
+        )
+    return moment.astimezone(timezone.utc)
+
+
+@app.command("fetch-quotes")
+def fetch_quotes(
+    ctx: typer.Context,
+    config: Path = ConfigOpt,
+    symbol: list[str] = typer.Option(..., "--symbol", "-s", help="Símbolo (repetible), p. ej. BTC/USDT."),
+    since: str = typer.Option(..., "--since", help="Inicio ISO-8601 con zona horaria."),
+    out: Path = typer.Option(..., "--out", help="CSV de salida: timestamp,symbol,price."),
+    exchange: str = typer.Option(DEFAULT_EXCHANGE, "--exchange", help="Exchange (ccxt) del que bajar velas."),
+    timeframe: str = typer.Option("1h", "--timeframe", help="Temporalidad de las velas."),
+    until: str | None = typer.Option(None, "--until", help="Fin ISO-8601 con zona horaria (por defecto, ahora)."),
+) -> None:
+    """Baja velas históricas y escribe el CSV de cotizaciones que lee el backtest.
+
+    Códigos de salida: 0 todo bajado; 1 nada que escribir o fallo general; 2 argumentos
+    inválidos; 3 descarga parcial (fichero escrito, pero faltan símbolos o quedó recortada).
+    """
+    deps = _deps(ctx)
+    cfg = _load(config)
+    now = (deps.now or (lambda: datetime.now(timezone.utc)))()
+    start = _parse_aware(since, "--since")
+    end = _parse_aware(until, "--until") if until is not None else now
+    if start >= now:
+        raise _fail("--since está en el futuro: no hay velas que bajar", 2)
+    if start >= end:
+        raise _fail("--since debe ser anterior a --until", 2)
+    end = min(end, now)
+
+    try:
+        client = deps.history_client if deps.history_client is not None else make_history_client(exchange)
+    except HistoryError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+    try:
+        client.load_markets()
+    except Exception as exc:  # red, exchange caído: mensaje, no traza
+        raise _fail(f"no se pudieron cargar los mercados de {exchange}: {exc}") from None
+    try:
+        validate_timeframe(client, timeframe)
+    except HistoryError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+
+    sleep = deps.sleep if deps.sleep is not None else time.sleep
+    symbols = list(dict.fromkeys(s.strip() for s in symbol))
+    _say(cfg, f"bajando {timeframe} de {exchange}: {', '.join(symbols)} ({start.isoformat()} -> {end.isoformat()})")
+
+    quotes: list[Quote] = []
+    problems = 0
+    for sym in symbols:
+        try:
+            result = fetch_candles(
+                client, sym, timeframe, start, end, now=now, sleep=sleep,
+                page_limit=FETCH_PAGE_LIMIT, max_requests=FETCH_MAX_REQUESTS,
+            )
+        except SymbolNotFound:
+            problems += 1
+            _say(cfg, f"{sym}: no existe en {exchange}; se omite y se sigue con los demás")
+            continue
+        except HistoryError as exc:
+            problems += 1
+            _say(cfg, f"{sym}: falló la descarga ({exc}); se omite y se sigue con los demás")
+            continue
+        if not result.complete:
+            problems += 1
+            _say(
+                cfg,
+                f"{sym}: descarga incompleta, se alcanzó el tope de {FETCH_MAX_REQUESTS} peticiones; "
+                "el histórico termina antes de lo pedido",
+            )
+        if not result.quotes:
+            problems += 1
+            _say(cfg, f"{sym}: el exchange no devolvió velas en ese rango")
+            continue
+        if result.skipped:
+            _say(cfg, f"{sym}: {result.skipped} velas ilegibles descartadas")
+        _say(cfg, f"{sym}: {len(result.quotes)} velas")
+        quotes.extend(result.quotes)
+
+    if not quotes:
+        raise _fail(f"{mode_prefix(cfg.mode)} | no se bajó ninguna vela; no se escribe {out}")
+    try:
+        write_quotes_csv(out, quotes)
+    except HistoryError as exc:
+        raise _fail(f"{mode_prefix(cfg.mode)} | {exc}") from None
+    first = min(q.timestamp for q in quotes)
+    last = max(q.timestamp for q in quotes)
+    _say(cfg, f"{len(quotes)} velas, de {first.isoformat()} a {last.isoformat()}, escritas en {out}")
+    if problems:
+        raise _fail(f"{mode_prefix(cfg.mode)} | descarga parcial: {problems} problema(s) arriba", 3)
+
+
+@app.command("fetch-solana-signals")
+def fetch_solana_signals(
+    ctx: typer.Context,
+    config: Path = ConfigOpt,
+    root: Path = RootOpt,
+    wallet: list[str] = typer.Option(..., "--wallet", "-w", help="Wallet de Solana a seguir (repetible)."),
+    since: str = typer.Option(..., "--since", help="Inicio ISO-8601 con zona horaria."),
+    out: Path = typer.Option(..., "--out", help="CSV de salida: timestamp,trader_id,symbol,side,amount_usd,signature."),
+    token_map: Path | None = typer.Option(
+        None, "--token-map", help="YAML/JSON opcional con 'mint: SÍMBOLO' para los tokens que sigues."
+    ),
+) -> None:
+    """Lee los swaps de unas wallets de Solana vía Helius y escribe el CSV de señales del backtest.
+
+    La clave va en HELIUS_API_KEY (entorno o .env de --root), nunca en el YAML. Solo se escriben
+    los swaps valorables en dólares (stablecoin <-> token); el resto se omite y se cuenta.
+
+    Códigos de salida: 0 todo leído; 1 nada que escribir o fallo general; 2 argumentos o clave
+    inválidos; 3 lectura parcial (fichero escrito, pero falló una wallet o quedó recortada).
+    """
+    deps = _deps(ctx)
+    cfg = _load(config)
+    now = (deps.now or (lambda: datetime.now(timezone.utc)))()
+    start = _parse_aware(since, "--since")
+    if start >= now:
+        raise _fail("--since está en el futuro: no hay swaps que leer", 2)
+    try:
+        wallets = [validate_wallet(w.strip()) for w in dict.fromkeys(wallet)]
+        api_key = load_api_key(os.environ, root)
+        tokens = load_token_map(token_map) if token_map is not None else {}
+    except HeliusError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+
+    client = deps.solana_client if deps.solana_client is not None else make_solana_client()
+    sleep = deps.sleep if deps.sleep is not None else time.sleep
+    _say(cfg, f"leyendo swaps de {len(wallets)} wallet(s) desde {start.isoformat()}")
+
+    signals: list = []
+    omitted: dict[str, int] = {}
+    signatures: dict[str, str] = {}
+    problems = 0
+    for address in wallets:
+        try:
+            scan = fetch_wallet_swaps(client, address, api_key, since=start, token_map=tokens, sleep=sleep)
+        except HeliusOrderError as exc:
+            # Integridad de datos, no lectura parcial: no se escribe nada y no se sigue.
+            raise _fail(f"{mode_prefix(cfg.mode)} | {address}: {exc}; no se escribe {out}") from None
+        except HeliusError as exc:
+            problems += 1
+            _say(cfg, f"{address}: falló la lectura ({exc}); se sigue con las demás")
+            continue
+        if not scan.complete:
+            problems += 1
+            why = (
+                "el servidor ignoró el cursor de paginación (página llena repetida)"
+                if scan.stop == "cursor_stalled"
+                else "se alcanzó el tope de peticiones"
+            )
+            _say(cfg, f"{address}: lectura incompleta, {why}; el historial termina antes de lo pedido")
+        _say(cfg, f"{address}: {len(scan.signals)} señales")
+        signals.extend(scan.signals)
+        signatures.update(scan.signatures)
+        for reason, n in scan.omitted.items():
+            omitted[reason] = omitted.get(reason, 0) + n
+
+    total_omitted = sum(omitted.values())
+    if total_omitted:
+        _say(cfg, f"{total_omitted} swaps omitidos por no poder valorarse en dólares:")
+        for reason, n in sorted(omitted.items()):
+            _say(cfg, f"  {reason}: {n} ({OMISSION_REASONS.get(reason, reason)})")
+    if not signals:
+        raise _fail(f"{mode_prefix(cfg.mode)} | no hay ninguna señal que escribir; no se escribe {out}")
+    signals.sort(key=lambda s: (s.timestamp, s.id))
+    try:
+        write_signals_csv(out, signals, signatures)
+    except HeliusError as exc:
+        raise _fail(f"{mode_prefix(cfg.mode)} | {exc}") from None
+    _say(cfg, f"{len(signals)} señales escritas en {out}")
+    if problems:
+        raise _fail(f"{mode_prefix(cfg.mode)} | lectura parcial: {problems} problema(s) arriba", 3)
 
 
 def _open_positions(cfg: BotConfig, root: Path) -> list:

@@ -12,3 +12,5 @@ STOP
 logs/
 .pytest_cache/
 .superpowers/
+ejemplos/*.csv
+ejemplos/*.html

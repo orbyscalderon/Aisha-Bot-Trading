@@ -15,7 +15,7 @@ import ccxt
 
 from core.models import Market, Quote, Side, Signal
 from ports.market import MarketDataSource, MarketUnpriceable, QuoteUnavailable
-from ports.signal_source import SignalSource
+from ports.signal_source import SignalSource, signature_signal_id
 
 MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 1.0
@@ -210,6 +210,10 @@ class CexCsvSignalSource(SignalSource):
 
     El id es el hash de la fila completa: estable entre lecturas, porque el id
     de la señal alimenta el client_order_id que impide comprar dos veces lo mismo.
+    Columna opcional ``signature`` (firma de la transacción en cadena): si trae valor, el id
+    deriva de ella, de modo que dos operaciones idénticas en hora e importe no colisionan. Las
+    columnas se leen por nombre; sin la columna o con ella vacía, el id sigue siendo el hash de
+    la fila, así que los CSV existentes conservan sus ids.
     """
 
     name = "cex"
@@ -229,10 +233,16 @@ class CexCsvSignalSource(SignalSource):
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
                 amount = (row["amount_usd"] or "").strip()
+                signature = (row.get("signature") or "").strip()
+                trader = row["trader_id"].strip()
                 signals.append(
                     Signal(
-                        id=hashlib.sha256(key.encode("utf-8")).hexdigest()[:32],
-                        trader_id=row["trader_id"].strip(),
+                        id=(
+                            signature_signal_id(signature, trader)
+                            if signature
+                            else hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+                        ),
+                        trader_id=trader,
                         market=self._market,
                         symbol=row["symbol"].strip(),
                         side=Side(row["side"].strip().lower()),
