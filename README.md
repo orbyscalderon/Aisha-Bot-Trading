@@ -1,4 +1,6 @@
-# Bot de copy-trading
+# Aisha Bot Trading
+
+Bot de copy-trading multimercado.
 
 Copia las compras de traders que sigues, con límites de riesgo estrictos, y te deja
 **probar la estrategia sobre datos pasados antes de arriesgar nada**.
