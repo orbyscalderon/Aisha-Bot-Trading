@@ -48,7 +48,7 @@ Decisiones:
 - Paginación con ``before`` = firma de la última transacción de la página. Para si la página
   viene vacía, si ya no trae nada nuevo (cursor sin avanzar), si llega a antes de ``since``, o al
   tope duro de peticiones (los reintentos también cuentan); el tope se reporta como
-  ``complete=False`` porque un histórico recortado en silencio engaña.
+  ``complete=False``, igual que una página llena que no avanza (``cursor_stalled``: cursor ignorado) porque un histórico recortado en silencio engaña.
 - La clave de API viaja en la URL (la documentación de Helius solo describe el parámetro
   ``api-key``; no se pudo confirmar autenticación por cabecera). httpx escribe la URL completa a
   nivel INFO en cada petición: la fábrica de registros limpia ``api-key=...`` en todo registro de
@@ -110,6 +110,7 @@ OMISSION_REASONS = {
     "no_stable": "swap sin stablecoin en ningún lado (token->token o SOL<->token): sin precio no se puede valorar",
     "stable_to_stable": "swap entre stablecoins: no es una posición que copiar",
     "ambiguous": "swap con varios tokens o varias stablecoins en un lado: no se sabe qué se compró",
+    "below_dust": "swap con SOL por debajo de 0,01 SOL: se ignora como polvo y no queda ningún token que identifique la operación",
     "zero_amount": "importe de la stablecoin igual a cero",
     "failed_tx": "transacción fallida en la cadena",
     "no_swap_event": "Helius no devolvió el evento de swap interpretado",
@@ -296,7 +297,7 @@ def _sanitize_symbol(value: Any) -> str | None:
 
 
 def _wallet_side(
-    sig: str, legs: list, native: Any, wallet: str, token_symbols: dict[str, str]
+    sig: str, legs: list, native: Any, wallet: str, token_symbols: dict[str, str], dusted: list[bool]
 ) -> dict[str, Decimal]:
     """Importe por mint de un lado del swap, solo con las patas de la wallet seguida."""
     totals: dict[str, Decimal] = {}
@@ -316,6 +317,7 @@ def _wallet_side(
             totals[WSOL_MINT] = totals.get(WSOL_MINT, Decimal(0)) + lamports.scaleb(-LAMPORTS_PER_SOL_DECIMALS)
     if WSOL_MINT in totals and totals[WSOL_MINT] < DUST_SOL:
         del totals[WSOL_MINT]  # polvo: no es un token del swap
+        dusted[0] = True
     return totals
 
 
@@ -346,10 +348,11 @@ def parse_swap(
         raise _fail(sig, f"'events.swap' debería ser un objeto y es {type(event).__name__}")
 
     symbols: dict[str, str] = {}
-    sold = _wallet_side(sig, _legs(sig, event, "tokenInputs"), event.get("nativeInput"), wallet, symbols)
-    got = _wallet_side(sig, _legs(sig, event, "tokenOutputs"), event.get("nativeOutput"), wallet, symbols)
+    dusted = [False]  # ¿se descartó una pata de SOL por ser polvo?
+    sold = _wallet_side(sig, _legs(sig, event, "tokenInputs"), event.get("nativeInput"), wallet, symbols, dusted)
+    got = _wallet_side(sig, _legs(sig, event, "tokenOutputs"), event.get("nativeOutput"), wallet, symbols, dusted)
     if not sold and not got:
-        return "not_participant"
+        return "below_dust" if dusted[0] else "not_participant"
 
     stable_sold = [m for m in sold if m in STABLE_MINTS]
     stable_got = [m for m in got if m in STABLE_MINTS]
@@ -358,7 +361,9 @@ def parse_swap(
     if not stable_sold and not stable_got:
         return "no_stable"
     if not token_sold and not token_got:
-        return "stable_to_stable" if stable_sold and stable_got else "ambiguous"
+        if stable_sold and stable_got:
+            return "stable_to_stable"
+        return "below_dust" if dusted[0] else "ambiguous"
 
     if len(stable_sold) == 1 and not token_sold and not stable_got and len(token_got) == 1:
         side, stable, token, amounts = Side.BUY, stable_sold[0], token_got[0], sold
@@ -390,11 +395,11 @@ class SwapScan:
     omitted: dict[str, int] = field(default_factory=dict)
     signatures: dict[str, str] = field(default_factory=dict)  # id de la señal -> firma
     requests: int = 0
-    stop: str = ""  # empty | no_advance | since | max_requests
+    stop: str = ""  # empty | no_advance | cursor_stalled | since | max_requests
 
     @property
     def complete(self) -> bool:
-        return self.stop != "max_requests"
+        return self.stop not in ("max_requests", "cursor_stalled")
 
 
 def make_client() -> httpx.Client:
@@ -486,17 +491,22 @@ def fetch_wallet_swaps(
             scan.stop = "empty"
             break
         headers = [_header(tx) for tx in page]
-        stamps = ([newest_prev] if newest_prev is not None else []) + [h[1] for h in headers]
+        stamps = ([newest_prev] if newest_prev is not None else []) + [
+            h[1] for h in headers if h[0] not in seen
+        ]
         if any(later > earlier for earlier, later in zip(stamps, stamps[1:])):
             raise HeliusError(
                 "las transacciones no vienen de más nueva a más antigua: el orden de Helius cambió y "
                 "--since/la paginación darían un resultado truncado; se aborta"
             )
-        newest_prev = headers[-1][1]
         fresh = [(tx, h) for tx, h in zip(page, headers) if h[0] not in seen]
         if not fresh:
-            scan.stop = "no_advance"
+            # Página llena que no avanza: el servidor ignora el cursor, no es el final del historial
+            # (se leería una muestra de las primeras transacciones creyéndola el total). Una página
+            # a medias que no avanza sí puede ser el final legítimo.
+            scan.stop = "cursor_stalled" if len(page) >= page_limit else "no_advance"
             break
+        newest_prev = headers[-1][1]
         for tx, (sig, moment) in fresh:
             seen.add(sig)
             if since is not None and moment < since:

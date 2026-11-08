@@ -170,3 +170,21 @@ def test_load_token_map_rejects_bad_content(tmp_path, content):
 def test_load_token_map_missing_file(tmp_path):
     with pytest.raises(HeliusError):
         load_token_map(tmp_path / "nope.yaml")
+
+
+def test_ignored_cursor_on_a_full_page_is_a_partial_read_with_code_3(cfg_path, tmp_path):
+    # 100 swaps = pagina llena; el servidor ignora `before` y repite la misma pagina
+    txs = [buy(f"s{i}", T0 + 1000 - i) for i in range(100)]
+    deps_server = Helius(txs, page=100, ignore_before=True)
+    deps = CliDeps(
+        solana_client=httpx.Client(transport=httpx.MockTransport(deps_server)),
+        sleep=lambda s: None, now=lambda: NOW,
+    )
+    out = tmp_path / "o.csv"
+    r = CliRunner().invoke(app, [
+        "fetch-solana-signals", "--config", str(cfg_path), "--root", str(tmp_path),
+        "--wallet", WALLET, "--since", SINCE, "--out", str(out),
+    ], obj=deps, env={"HELIUS_API_KEY": KEY})
+    assert r.exit_code == 3, r.output
+    assert "lectura incompleta" in r.output and "cursor" in r.output
+    assert out.exists()

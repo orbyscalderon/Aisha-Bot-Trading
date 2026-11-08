@@ -328,6 +328,20 @@ def test_stops_when_the_cursor_does_not_advance():
     assert len(result.signals) == 2  # sin duplicados
 
 
+def test_full_page_that_does_not_advance_is_an_incomplete_read():
+    # pagina llena que se repite = cursor que el servidor ignora, NO el final del historial
+    server = Helius([buy("s1"), buy("s2")], page=2, ignore_before=True)
+    result, _ = scan(server, page_limit=2)
+    assert result.stop == "cursor_stalled" and not result.complete
+    assert len(result.signals) == 2
+
+
+def test_partial_page_that_does_not_advance_is_a_legitimate_end():
+    server = Helius([buy("s1"), buy("s2")], page=2, ignore_before=True)
+    result, _ = scan(server, page_limit=3)
+    assert result.stop == "no_advance" and result.complete
+
+
 def test_hard_cap_on_requests_marks_the_scan_incomplete():
     server = Helius([buy(f"s{i}", T0 + 100 - i) for i in range(50)], page=1)
     result, _ = scan(server, max_requests=5)
@@ -531,3 +545,22 @@ def test_unrelated_loggers_are_left_alone(caplog):
     with caplog.at_level(logging.INFO):
         logging.getLogger("otro").info("api-key=visible")
     assert "api-key=visible" in caplog.text
+
+
+def test_stable_to_sol_below_dust_has_its_own_omission_reason():
+    t = tx("s", ins=[leg(USDC, "1000000", 6)], native_out={"account": WALLET, "amount": "5000000"})
+    assert parse_swap(t, WALLET) == "below_dust"
+    t2 = tx("s", native_in={"account": WALLET, "amount": "5000000"}, outs=[leg(USDT, "1000000", 6)])
+    assert parse_swap(t2, WALLET) == "below_dust"
+
+
+def test_below_dust_is_not_used_when_the_real_cause_is_ambiguity():
+    t = tx("s", ins=[leg(USDC, "1000000", 6)], outs=[leg(BONK, "1", 5), leg(WIF, "1", 6)],
+           native_out={"account": WALLET, "amount": "5000000"})
+    assert parse_swap(t, WALLET) == "ambiguous"
+
+
+def test_omission_text_for_below_dust_names_the_threshold():
+    from adapters.solana.source import OMISSION_REASONS
+
+    assert "0,01 SOL" in OMISSION_REASONS["below_dust"]

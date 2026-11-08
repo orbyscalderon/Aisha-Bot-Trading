@@ -688,7 +688,12 @@ def fetch_solana_signals(
             continue
         if not scan.complete:
             problems += 1
-            _say(cfg, f"{address}: lectura incompleta, se alcanzó el tope de peticiones; el historial termina antes de lo pedido")
+            why = (
+                "el servidor ignoró el cursor de paginación (página llena repetida)"
+                if scan.stop == "cursor_stalled"
+                else "se alcanzó el tope de peticiones"
+            )
+            _say(cfg, f"{address}: lectura incompleta, {why}; el historial termina antes de lo pedido")
         _say(cfg, f"{address}: {len(scan.signals)} señales")
         signals.extend(scan.signals)
         signatures.update(scan.signatures)
