@@ -1,0 +1,5 @@
+# Mapeo opcional mint -> simbolo para `fetch-solana-signals --token-map`.
+# Solo para los tokens que sigues de cerca: sin entrada, el simbolo es la direccion del mint
+# (o el que declare el propio token, que cualquiera puede falsear).
+DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263: BONK
+EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm: WIF

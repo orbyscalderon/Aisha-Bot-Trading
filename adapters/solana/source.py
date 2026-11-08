@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import httpx
+import yaml
 
 from core.models import Market, Side, Signal
 from ports.signal_source import SignalSource
@@ -174,6 +175,31 @@ def validate_wallet(wallet: str) -> str:
     if not isinstance(wallet, str) or not _WALLET_RE.match(wallet):
         raise HeliusError(f"dirección de wallet no válida (se esperan 32-44 caracteres base58): {wallet!r}")
     return wallet
+
+
+def load_token_map(path: Path) -> dict[str, str]:
+    """Mapeo opcional ``mint: SÍMBOLO`` (YAML o JSON) para los tokens que se siguen de cerca.
+
+    Va en un fichero propio y no en el YAML del bot porque esa configuración es estricta
+    (rechaza claves desconocidas) y pertenece al núcleo, que no sabe de Solana.
+    """
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8-sig"))  # JSON es YAML válido
+    except (OSError, yaml.YAMLError) as exc:
+        raise HeliusError(f"no se pudo leer el mapeo de tokens {path}: {type(exc).__name__}") from None
+    if not isinstance(data, dict):
+        raise HeliusError(f"el mapeo de tokens {path} debe ser un diccionario mint: símbolo")
+    result: dict[str, str] = {}
+    for mint, symbol in data.items():
+        if not isinstance(mint, str) or not _WALLET_RE.match(mint):
+            raise HeliusError(f"mapeo de tokens: {mint!r} no es una dirección de mint válida")
+        clean = _sanitize_symbol(symbol)
+        if clean is None:
+            raise HeliusError(
+                f"mapeo de tokens: símbolo no válido para {mint}: {symbol!r} (letras, cifras, . _ -; máx. 20)"
+            )
+        result[mint] = clean
+    return result
 
 
 # --- interpretación de una transacción ---

@@ -45,6 +45,16 @@ from adapters.cex.history import (
     write_quotes_csv,
 )
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
+from adapters.solana.source import (
+    OMISSION_REASONS,
+    HeliusError,
+    fetch_wallet_swaps,
+    load_api_key,
+    load_token_map,
+    make_client as make_solana_client,
+    validate_wallet,
+    write_signals_csv,
+)
 from adapters.notify.console import ConsoleNotifier
 from adapters.notify.telegram import TelegramNotifier
 from adapters.paper.executor import PaperExecutor
@@ -93,7 +103,8 @@ class CliDeps:
     notifier: Notifier | None = None
     history_client: Any = None  # cliente ccxt de fetch-quotes
     sleep: Callable[[float], None] | None = None  # temporizador de fetch-quotes
-    now: Callable[[], datetime] | None = None  # reloj de fetch-quotes
+    now: Callable[[], datetime] | None = None  # reloj de fetch-quotes y fetch-solana-signals
+    solana_client: Any = None  # cliente httpx de fetch-solana-signals
 
 
 # --- composición ---
@@ -625,6 +636,78 @@ def fetch_quotes(
     _say(cfg, f"{len(quotes)} velas, de {first.isoformat()} a {last.isoformat()}, escritas en {out}")
     if problems:
         raise _fail(f"{mode_prefix(cfg.mode)} | descarga parcial: {problems} problema(s) arriba", 3)
+
+
+@app.command("fetch-solana-signals")
+def fetch_solana_signals(
+    ctx: typer.Context,
+    config: Path = ConfigOpt,
+    root: Path = RootOpt,
+    wallet: list[str] = typer.Option(..., "--wallet", "-w", help="Wallet de Solana a seguir (repetible)."),
+    since: str = typer.Option(..., "--since", help="Inicio ISO-8601 con zona horaria."),
+    out: Path = typer.Option(..., "--out", help="CSV de salida: timestamp,trader_id,symbol,side,amount_usd."),
+    token_map: Path | None = typer.Option(
+        None, "--token-map", help="YAML/JSON opcional con 'mint: SÍMBOLO' para los tokens que sigues."
+    ),
+) -> None:
+    """Lee los swaps de unas wallets de Solana vía Helius y escribe el CSV de señales del backtest.
+
+    La clave va en HELIUS_API_KEY (entorno o .env de --root), nunca en el YAML. Solo se escriben
+    los swaps valorables en dólares (stablecoin <-> token); el resto se omite y se cuenta.
+
+    Códigos de salida: 0 todo leído; 1 nada que escribir o fallo general; 2 argumentos o clave
+    inválidos; 3 lectura parcial (fichero escrito, pero falló una wallet o quedó recortada).
+    """
+    deps = _deps(ctx)
+    cfg = _load(config)
+    now = (deps.now or (lambda: datetime.now(timezone.utc)))()
+    start = _parse_aware(since, "--since")
+    if start >= now:
+        raise _fail("--since está en el futuro: no hay swaps que leer", 2)
+    try:
+        wallets = [validate_wallet(w.strip()) for w in dict.fromkeys(wallet)]
+        api_key = load_api_key(os.environ, root)
+        tokens = load_token_map(token_map) if token_map is not None else {}
+    except HeliusError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+
+    client = deps.solana_client if deps.solana_client is not None else make_solana_client()
+    sleep = deps.sleep if deps.sleep is not None else time.sleep
+    _say(cfg, f"leyendo swaps de {len(wallets)} wallet(s) desde {start.isoformat()}")
+
+    signals: list = []
+    omitted: dict[str, int] = {}
+    problems = 0
+    for address in wallets:
+        try:
+            scan = fetch_wallet_swaps(client, address, api_key, since=start, token_map=tokens, sleep=sleep)
+        except HeliusError as exc:
+            problems += 1
+            _say(cfg, f"{address}: falló la lectura ({exc}); se sigue con las demás")
+            continue
+        if not scan.complete:
+            problems += 1
+            _say(cfg, f"{address}: lectura incompleta, se alcanzó el tope de peticiones; el historial termina antes de lo pedido")
+        _say(cfg, f"{address}: {len(scan.signals)} señales")
+        signals.extend(scan.signals)
+        for reason, n in scan.omitted.items():
+            omitted[reason] = omitted.get(reason, 0) + n
+
+    total_omitted = sum(omitted.values())
+    if total_omitted:
+        _say(cfg, f"{total_omitted} swaps omitidos por no poder valorarse en dólares:")
+        for reason, n in sorted(omitted.items()):
+            _say(cfg, f"  {reason}: {n} ({OMISSION_REASONS.get(reason, reason)})")
+    if not signals:
+        raise _fail(f"{mode_prefix(cfg.mode)} | no hay ninguna señal que escribir; no se escribe {out}")
+    signals.sort(key=lambda s: (s.timestamp, s.id))
+    try:
+        write_signals_csv(out, signals)
+    except HeliusError as exc:
+        raise _fail(f"{mode_prefix(cfg.mode)} | {exc}") from None
+    _say(cfg, f"{len(signals)} señales escritas en {out}")
+    if problems:
+        raise _fail(f"{mode_prefix(cfg.mode)} | lectura parcial: {problems} problema(s) arriba", 3)
 
 
 def _open_positions(cfg: BotConfig, root: Path) -> list:
