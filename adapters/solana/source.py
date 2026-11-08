@@ -31,6 +31,13 @@ Decisiones:
   stablecoins se reconocen por la DIRECCIÓN DEL MINT, nunca por el símbolo (cualquiera puede
   acuñar un token que se llame "USDC").
 - Los importes vienen en unidades mínimas: ``Decimal(str(valor)).scaleb(-decimals)``. Nunca float.
+  La suposición se autoverifica: las unidades mínimas son SIEMPRE enteras, así que un
+  ``tokenAmount`` con punto decimal, exponente o signo (lo que mandaría Helius si usara unidades
+  de interfaz) lanza ``HeliusError`` en vez de dar un importe falso por un factor 10^decimals.
+- SOL: la pata nativa (lamports, 9 decimales) o wSOL de la wallet cuenta como token del swap
+  solo si llega a ``DUST_SOL``; por debajo se ignora (alquiler y restos de las rutas Jupiter).
+  Su símbolo por defecto es ``SOL``. Se exige que cada página venga de más nueva a más antigua
+  (si no, ``since`` cortaría pronto y el resultado saldría truncado en silencio): si no, error.
 - ``Signal.id`` deriva de la firma (más la wallet, porque una firma puede afectar a dos wallets
   seguidas). Ese id alimenta el ``client_order_id`` que impide comprar dos veces la misma señal:
   no puede depender del orden de lectura, del importe ni de la hora de la descarga.
@@ -42,11 +49,11 @@ Decisiones:
   viene vacía, si ya no trae nada nuevo (cursor sin avanzar), si llega a antes de ``since``, o al
   tope duro de peticiones (los reintentos también cuentan); el tope se reporta como
   ``complete=False`` porque un histórico recortado en silencio engaña.
-- La clave de API viaja en la URL. httpx escribe la URL completa a nivel INFO en cada petición:
-  un ``logging.Filter`` en los loggers ``httpx`` y ``httpcore`` limpia ``api-key=...`` antes de
-  que el registro llegue a ningún handler, y los mensajes de error de este módulo pasan por
-  ``_scrub``. El filtro es de logger: no cubre a un handler colgado de otro logger ni a un
-  cliente con un hook propio.
+- La clave de API viaja en la URL (la documentación de Helius solo describe el parámetro
+  ``api-key``; no se pudo confirmar autenticación por cabecera). httpx escribe la URL completa a
+  nivel INFO en cada petición: la fábrica de registros limpia ``api-key=...`` en todo registro de
+  ``httpx``/``httpcore`` y de sus loggers hijos al crearlo, y los mensajes de error de este módulo
+  pasan por ``_scrub``. No cubre a un cliente con un hook propio que escriba la URL por su cuenta.
 - Cliente y temporizador se inyectan: los tests no tocan la red ni duermen.
 """
 
@@ -88,6 +95,16 @@ STABLE_MINTS = {
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
 }
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+DEFAULT_SYMBOLS = {WSOL_MINT: "SOL"}  # el mint de wSOL no es un símbolo que alguien quiera leer
+LAMPORTS_PER_SOL_DECIMALS = 9
+# Polvo de SOL: por debajo de 0,01 SOL una pata nativa/wSOL de la wallet NO es un token del swap,
+# es el cierre de la cuenta wSOL, la devolución de alquiler o restos de comisión que Jupiter deja
+# en casi todas las rutas. El alquiler de una cuenta de tokens son 0,00203928 SOL (2.039.280
+# lamports), así que 0,01 SOL deja margen para varias cuentas cerradas a la vez (~5) y, a la vez,
+# queda muy por debajo de cualquier swap real con SOL (a ~200 USD/SOL, 0,01 SOL son ~2 USD; una
+# señal de menos que eso no se copiaría de todos modos). Un swap USDC<->SOL por debajo del umbral
+# se omite como ``ambiguous``: sin patas que lo identifiquen, es mejor no emitirlo.
+DUST_SOL = Decimal("0.01")
 
 OMISSION_REASONS = {
     "no_stable": "swap sin stablecoin en ningún lado (token->token o SOL<->token): sin precio no se puede valorar",
@@ -116,29 +133,39 @@ def _scrub(text: str, key: str = "") -> str:
     return _KEY_PARAM.sub(r"\1***", text)
 
 
-class _ApiKeyRedactingFilter(logging.Filter):
-    """Quita ``api-key=...`` de los registros de httpx/httpcore, y los deja pasar."""
+_SCRUBBED_ROOTS = ("httpx", "httpcore")
 
-    def filter(self, record: logging.LogRecord) -> bool:
+
+def _install_log_scrubbing() -> None:
+    """Limpia ``api-key=...`` de TODO registro de httpx/httpcore y de sus hijos.
+
+    Un ``logging.Filter`` de logger solo se aplica a los registros emitidos en ese mismo logger,
+    no a los que llegan propagados desde hijos (``httpcore.http11``...). Por eso se envuelve la
+    fábrica de registros: el texto se limpia al CREAR el registro, antes de que ningún logger,
+    filtro o handler lo vea, sea cual sea el logger hijo y el handler que lo recoja.
+    """
+    current = logging.getLogRecordFactory()
+    if getattr(current, "_scrubs_api_key", False):
+        return
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = current(*args, **kwargs)
         try:
-            message = record.getMessage()
-            cleaned = _scrub(message)
-            if cleaned != message:
-                record.msg = cleaned
-                record.args = None
-        except Exception:  # noqa: BLE001 - un filtro nunca debe romper el logging
+            if record.name.split(".")[0] in _SCRUBBED_ROOTS:
+                message = record.getMessage()
+                cleaned = _scrub(message)
+                if cleaned != message:
+                    record.msg = cleaned
+                    record.args = None
+        except Exception:  # noqa: BLE001 - limpiar nunca debe romper el logging
             pass
-        return True
+        return record
+
+    factory._scrubs_api_key = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
 
 
-def _install_log_filter() -> None:
-    for name in ("httpx", "httpcore"):
-        target = logging.getLogger(name)
-        if not any(isinstance(f, _ApiKeyRedactingFilter) for f in target.filters):
-            target.addFilter(_ApiKeyRedactingFilter())
-
-
-_install_log_filter()
+_install_log_scrubbing()
 
 
 # --- clave y wallets ---
@@ -245,16 +272,21 @@ def _amount(sig: str, leg: Any) -> tuple[str, Decimal]:
     decimals = raw.get("decimals")
     if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 30:
         raise _fail(sig, f"pata {mint}: 'decimals' no es un entero válido: {decimals!r}")
-    units = raw.get("tokenAmount")
-    if units is None or isinstance(units, bool):
-        raise _fail(sig, f"pata {mint}: 'tokenAmount' ausente o inválido")
-    try:
-        value = Decimal(str(units))  # nunca Decimal(float)
-    except InvalidOperation:
-        raise _fail(sig, f"pata {mint}: 'tokenAmount' no numérico: {units!r}") from None
-    if not value.is_finite() or value < 0:
-        raise _fail(sig, f"pata {mint}: 'tokenAmount' no válido: {units!r}")
-    return mint, value.scaleb(-decimals)
+    return mint, _units(sig, f"pata {mint}: 'tokenAmount'", raw.get("tokenAmount")).scaleb(-decimals)
+
+
+def _units(sig: str, what: str, value: Any) -> Decimal:
+    """Unidades mínimas: un entero sin signo. Cualquier otra forma delata unidades de interfaz."""
+    if value is None or isinstance(value, bool):
+        raise _fail(sig, f"{what} ausente o inválido")
+    text = str(value)  # nunca Decimal(float)
+    if not re.fullmatch(r"[0-9]+", text):
+        raise _fail(
+            sig,
+            f"{what} no es un entero de unidades mínimas ({value!r}); ¿manda Helius unidades de "
+            "interfaz? Con ellas el importe saldría mal por un factor 10^decimals, así que se aborta",
+        )
+    return Decimal(text)
 
 
 def _sanitize_symbol(value: Any) -> str | None:
@@ -280,7 +312,10 @@ def _wallet_side(
         if not isinstance(native, dict):
             raise _fail(sig, f"patas nativas ilegibles: {type(native).__name__}")
         if native.get("account") == wallet:
-            totals.setdefault(WSOL_MINT, Decimal(0))
+            lamports = _units(sig, "nativo 'amount'", native.get("amount"))
+            totals[WSOL_MINT] = totals.get(WSOL_MINT, Decimal(0)) + lamports.scaleb(-LAMPORTS_PER_SOL_DECIMALS)
+    if WSOL_MINT in totals and totals[WSOL_MINT] < DUST_SOL:
+        del totals[WSOL_MINT]  # polvo: no es un token del swap
     return totals
 
 
@@ -335,7 +370,7 @@ def parse_swap(
     usd = amounts[stable]
     if usd <= 0:
         return "zero_amount"
-    base = (token_map or {}).get(token) or symbols.get(token) or token
+    base = (token_map or {}).get(token) or DEFAULT_SYMBOLS.get(token) or symbols.get(token) or token
     return Signal(
         id=make_signal_id(sig, wallet),
         trader_id=wallet,
@@ -440,6 +475,7 @@ def fetch_wallet_swaps(
     counter = [0]
     seen: set[str] = set()
     before: str | None = None
+    newest_prev: datetime | None = None  # hora de la última transacción de la página anterior
 
     while counter[0] < max_requests:
         if counter[0] > 0:
@@ -449,6 +485,13 @@ def fetch_wallet_swaps(
             scan.stop = "empty"
             break
         headers = [_header(tx) for tx in page]
+        stamps = ([newest_prev] if newest_prev is not None else []) + [h[1] for h in headers]
+        if any(later > earlier for earlier, later in zip(stamps, stamps[1:])):
+            raise HeliusError(
+                "las transacciones no vienen de más nueva a más antigua: el orden de Helius cambió y "
+                "--since/la paginación darían un resultado truncado; se aborta"
+            )
+        newest_prev = headers[-1][1]
         fresh = [(tx, h) for tx, h in zip(page, headers) if h[0] not in seen]
         if not fresh:
             scan.stop = "no_advance"

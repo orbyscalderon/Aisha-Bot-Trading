@@ -26,6 +26,7 @@ USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 BONK = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 WIF = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
 WALLET = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+WSOL = "So11111111111111111111111111111111111111112"
 WALLET2 = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
 KEY = "SECRET-HELIUS-KEY-0123456789"
 T0 = 1_790_000_000  # segundos unix
@@ -103,9 +104,8 @@ def test_token_to_stable_is_a_sell():
 
 def test_amount_uses_decimals_exactly_and_accepts_numeric_json():
     assert parse_swap(buy("s", usdc="250123456"), WALLET).trader_amount_usd == Decimal("250.123456")
-    # int y float de JSON se convierten por str(), nunca Decimal(float)
+    # un int de JSON se convierte por str(), nunca Decimal(float)
     assert parse_swap(buy("s", usdc=250000000), WALLET).trader_amount_usd == Decimal("250")
-    assert parse_swap(buy("s", usdc=1e8), WALLET).trader_amount_usd == Decimal("100")
     t = tx("s", ins=[leg(USDC, "1", 6), leg(USDC, "2", 6)], outs=[leg(BONK, "1", 5)])
     assert parse_swap(t, WALLET).trader_amount_usd == Decimal("0.000003")
 
@@ -170,6 +170,15 @@ def test_only_the_followed_wallets_legs_count():
         lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount="-5"),
         lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount=None),
         lambda t: t.update(events=5),
+        # unidades minimas = enteros: lo demas delata que Helius manda unidades de interfaz
+        lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount="250.5"),
+        lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount="1e8"),
+        lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount=250.0),
+        lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount=1e8),
+        lambda t: t["events"]["swap"]["tokenInputs"][0]["rawTokenAmount"].update(tokenAmount=" 5"),
+        lambda t: t["events"]["swap"].update(nativeOutput={"account": WALLET, "amount": "0.5"}),
+        lambda t: t["events"]["swap"].update(nativeOutput={"account": WALLET}),
+        lambda t: t["events"]["swap"].update(nativeOutput="x"),
     ],
 )
 def test_unexpected_shape_raises_a_clear_error(mutate):
@@ -178,6 +187,72 @@ def test_unexpected_shape_raises_a_clear_error(mutate):
     with pytest.raises(HeliusError) as exc:
         parse_swap(t, WALLET)
     assert str(exc.value)
+
+
+def test_integrality_error_names_the_problem():
+    t = buy("sigX", usdc="250.5")
+    with pytest.raises(HeliusError, match="entero"):
+        parse_swap(t, WALLET)
+
+
+# --- pata de SOL nativo: polvo ignorado, swaps reales con SOL valorados ---
+
+DUST = {"account": WALLET, "amount": "2039280"}  # alquiler de una cuenta de tokens: 0,00203928 SOL
+
+
+def test_usdc_to_token_with_native_dust_output_is_still_a_signal():
+    # el caso real de Jupiter: el cierre de la cuenta wSOL devuelve alquiler en nativeOutput
+    t = buy("s")
+    t["events"]["swap"]["nativeOutput"] = DUST
+    s = parse_swap(t, WALLET)
+    assert not isinstance(s, str), s
+    assert s.side is Side.BUY and s.symbol == f"{BONK}/USDC" and s.trader_amount_usd == Decimal("250")
+
+
+def test_token_to_stable_with_native_dust_input_is_still_a_signal():
+    t = sell("s")
+    t["events"]["swap"]["nativeInput"] = DUST
+    assert parse_swap(t, WALLET).side is Side.SELL
+
+
+def test_wsol_token_leg_dust_is_ignored_too():
+    t = buy("s")
+    t["events"]["swap"]["tokenOutputs"].append(leg(WSOL, "2039280", 9))
+    assert parse_swap(t, WALLET).symbol == f"{BONK}/USDC"
+
+
+def test_dust_threshold_boundary():
+    just_under = buy("s")
+    just_under["events"]["swap"]["nativeOutput"] = {"account": WALLET, "amount": "9999999"}
+    assert not isinstance(parse_swap(just_under, WALLET), str)
+    at_threshold = buy("s")
+    at_threshold["events"]["swap"]["nativeOutput"] = {"account": WALLET, "amount": "10000000"}
+    assert parse_swap(at_threshold, WALLET) == "ambiguous"  # 0,01 SOL ya es un token de verdad
+
+
+def test_usdc_to_sol_is_a_buy_of_SOL_not_of_the_wsol_mint():
+    t = tx("s", ins=[leg(USDC, "150000000", 6)], native_out={"account": WALLET, "amount": "1000000000"})
+    s = parse_swap(t, WALLET)
+    assert s.symbol == "SOL/USDC" and s.side is Side.BUY and s.trader_amount_usd == Decimal("150")
+
+
+def test_sol_to_usdt_is_a_sell_of_SOL_and_wsol_leg_counts_like_native():
+    t = tx("s", ins=[leg(WSOL, "2000000000", 9)], outs=[leg(USDT, "300000000", 6)])
+    s = parse_swap(t, WALLET)
+    assert s.symbol == "SOL/USDT" and s.side is Side.SELL
+    t2 = tx("s", native_in={"account": WALLET, "amount": "2000000000"}, outs=[leg(USDT, "300000000", 6)])
+    assert parse_swap(t2, WALLET).symbol == "SOL/USDT"
+
+
+def test_native_leg_of_someone_else_is_ignored():
+    t = buy("s")
+    t["events"]["swap"]["nativeOutput"] = {"account": "otra", "amount": "5000000000"}
+    assert not isinstance(parse_swap(t, WALLET), str)
+
+
+def test_token_map_can_override_the_default_sol_symbol():
+    t = tx("s", ins=[leg(USDC, "150000000", 6)], native_out={"account": WALLET, "amount": "1000000000"})
+    assert parse_swap(t, WALLET, {WSOL: "WSOL"}).symbol == "WSOL/USDC"
 
 
 def test_non_dict_transaction_is_an_error():
@@ -426,3 +501,33 @@ def test_missing_or_empty_api_key_is_a_clear_error(tmp_path, content):
         (tmp_path / ".env").write_text(content, encoding="utf-8")
     with pytest.raises(HeliusError, match="HELIUS_API_KEY"):
         load_api_key({}, tmp_path)
+
+
+# --- orden de las paginas ---
+
+def test_page_not_newest_first_is_an_error_instead_of_a_silent_truncation():
+    server = Helius([buy("s1", T0), buy("s2", T0 + 10)], page=5)  # orden invertido
+    with pytest.raises(HeliusError, match="orden"):
+        scan(server, since=datetime.fromtimestamp(T0 - 5, tz=timezone.utc))
+
+
+def test_equal_timestamps_are_fine():
+    result, _ = scan(Helius([buy("s1", T0), buy("s2", T0), buy("s3", T0 - 1)], page=5))
+    assert len(result.signals) == 3
+
+
+# --- la limpieza de logs cubre tambien a los loggers hijos ---
+
+@pytest.mark.parametrize("name", ["httpx", "httpcore", "httpcore.http11", "httpcore.connection", "httpx._client"])
+def test_api_key_is_scrubbed_from_child_loggers(caplog, name):
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger(name).info("GET https://api.helius.xyz/v0/a/b?api-key=%s&type=SWAP", KEY)
+        logging.getLogger(name).debug("url=%s", f"https://x/?api-key={KEY}")
+    assert KEY not in caplog.text
+    assert "api-key=***" in caplog.text
+
+
+def test_unrelated_loggers_are_left_alone(caplog):
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("otro").info("api-key=visible")
+    assert "api-key=visible" in caplog.text
