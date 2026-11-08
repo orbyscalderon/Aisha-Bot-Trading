@@ -126,6 +126,14 @@ class HeliusError(Exception):
     """Fallo esperado al leer Helius; la CLI lo muestra como mensaje, nunca como traza."""
 
 
+class HeliusOrderError(HeliusError):
+    """Helius devolvió el historial fuera de orden: todo el resultado es sospechoso.
+
+    No es un fallo parcial recuperable (``since`` pudo cortar donde no debía), así que la CLI
+    lo trata como error duro y no como una lectura incompleta.
+    """
+
+
 # --- la clave no se filtra ---
 
 def _scrub(text: str, key: str = "") -> str:
@@ -363,7 +371,8 @@ def parse_swap(
     if not token_sold and not token_got:
         if stable_sold and stable_got:
             return "stable_to_stable"
-        return "below_dust" if dusted[0] else "ambiguous"
+        # polvo solo si no hay más de una stablecoin entre los dos lados; con dos, es ambiguo de verdad
+        return "below_dust" if dusted[0] and len(stable_sold) + len(stable_got) <= 1 else "ambiguous"
 
     if len(stable_sold) == 1 and not token_sold and not stable_got and len(token_got) == 1:
         side, stable, token, amounts = Side.BUY, stable_sold[0], token_got[0], sold
@@ -495,9 +504,10 @@ def fetch_wallet_swaps(
             h[1] for h in headers if h[0] not in seen
         ]
         if any(later > earlier for earlier, later in zip(stamps, stamps[1:])):
-            raise HeliusError(
-                "las transacciones no vienen de más nueva a más antigua: el orden de Helius cambió y "
-                "--since/la paginación darían un resultado truncado; se aborta"
+            raise HeliusOrderError(
+                "las transacciones no vienen de más nueva a más antigua: el orden de Helius cambió, "
+                "así que --since y la paginación pueden haber cortado donde no debían y el resultado "
+                "de esta wallet no es fiable"
             )
         fresh = [(tx, h) for tx, h in zip(page, headers) if h[0] not in seen]
         if not fresh:

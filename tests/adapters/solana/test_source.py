@@ -13,6 +13,7 @@ import pytest
 from adapters.cex.source import CexCsvSignalSource
 from adapters.solana.source import (
     HeliusError,
+    HeliusOrderError,
     SolanaWalletSignalSource,
     fetch_wallet_swaps,
     load_api_key,
@@ -521,8 +522,10 @@ def test_missing_or_empty_api_key_is_a_clear_error(tmp_path, content):
 
 def test_page_not_newest_first_is_an_error_instead_of_a_silent_truncation():
     server = Helius([buy("s1", T0), buy("s2", T0 + 10)], page=5)  # orden invertido
-    with pytest.raises(HeliusError, match="orden"):
+    with pytest.raises(HeliusError, match="orden") as exc:
         scan(server, since=datetime.fromtimestamp(T0 - 5, tz=timezone.utc))
+    assert isinstance(exc.value, HeliusOrderError)
+    assert "se aborta" not in str(exc.value)  # el texto no afirma lo que no ocurre
 
 
 def test_equal_timestamps_are_fine():
@@ -564,3 +567,13 @@ def test_omission_text_for_below_dust_names_the_threshold():
     from adapters.solana.source import OMISSION_REASONS
 
     assert "0,01 SOL" in OMISSION_REASONS["below_dust"]
+
+
+def test_two_stables_on_one_side_plus_sol_dust_is_ambiguous_not_below_dust():
+    t = tx("s", ins=[leg(USDC, "1000000", 6), leg(USDT, "1000000", 6)],
+           native_out={"account": WALLET, "amount": "5000000"})
+    assert parse_swap(t, WALLET) == "ambiguous"
+    # una stablecoin por lado + polvo tampoco es polvo-solo: es stable_to_stable
+    t2 = tx("s", ins=[leg(USDC, "1000000", 6)], outs=[leg(USDT, "1000000", 6)],
+            native_out={"account": WALLET, "amount": "5000000"})
+    assert parse_swap(t2, WALLET) == "stable_to_stable"

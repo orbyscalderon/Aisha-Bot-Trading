@@ -48,6 +48,7 @@ from adapters.cex.source import CexCsvSignalSource, CexDataSource
 from adapters.solana.source import (
     OMISSION_REASONS,
     HeliusError,
+    HeliusOrderError,
     fetch_wallet_swaps,
     load_api_key,
     load_token_map,
@@ -682,6 +683,9 @@ def fetch_solana_signals(
     for address in wallets:
         try:
             scan = fetch_wallet_swaps(client, address, api_key, since=start, token_map=tokens, sleep=sleep)
+        except HeliusOrderError as exc:
+            # Integridad de datos, no lectura parcial: no se escribe nada y no se sigue.
+            raise _fail(f"{mode_prefix(cfg.mode)} | {address}: {exc}; no se escribe {out}") from None
         except HeliusError as exc:
             problems += 1
             _say(cfg, f"{address}: falló la lectura ({exc}); se sigue con las demás")

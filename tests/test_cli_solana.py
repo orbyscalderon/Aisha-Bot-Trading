@@ -188,3 +188,24 @@ def test_ignored_cursor_on_a_full_page_is_a_partial_read_with_code_3(cfg_path, t
     assert r.exit_code == 3, r.output
     assert "lectura incompleta" in r.output and "cursor" in r.output
     assert out.exists()
+
+
+def test_reversed_page_order_is_a_hard_error_code_1_not_a_partial_3(cfg_path, tmp_path):
+    reversed_history = [buy("s1", T0), buy("s2", T0 + 10)]  # mas antigua primero: historial del reves
+    r, out = run(cfg_path, tmp_path, {WALLET: [buy("ok", T0 + 5)], WALLET2: reversed_history}, "--wallet", WALLET2)
+    assert r.exit_code == 1, r.output
+    assert "orden" in r.output and "no es fiable" in r.output
+    assert not out.exists()  # nada se escribe: ni siquiera lo de la wallet que salio bien
+    assert "Traceback" not in r.output
+
+
+def test_incomplete_read_still_exits_3(cfg_path, tmp_path):
+    txs = [buy(f"s{i}", T0 + 1000 - i) for i in range(100)]
+    server = Helius(txs, page=100, ignore_before=True)
+    deps = CliDeps(solana_client=httpx.Client(transport=httpx.MockTransport(server)),
+                   sleep=lambda s: None, now=lambda: NOW)
+    r = CliRunner().invoke(app, [
+        "fetch-solana-signals", "--config", str(cfg_path), "--root", str(tmp_path),
+        "--wallet", WALLET, "--since", SINCE, "--out", str(tmp_path / "o.csv"),
+    ], obj=deps, env={"HELIUS_API_KEY": KEY})
+    assert r.exit_code == 3
