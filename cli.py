@@ -45,6 +45,7 @@ from adapters.cex.history import (
     write_quotes_csv,
 )
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
+from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
 from adapters.solana.source import (
     OMISSION_REASONS,
     HeliusError,
@@ -650,11 +651,20 @@ def fetch_solana_signals(
     token_map: Path | None = typer.Option(
         None, "--token-map", help="YAML/JSON opcional con 'mint: SÍMBOLO' para los tokens que sigues."
     ),
+    sol_quotes: Path | None = typer.Option(
+        None, "--sol-quotes",
+        help="CSV de cotizaciones (timestamp,symbol,price) con SOL/USDT para valorar los swaps "
+             "contra SOL. Sin él se omiten: en Solana el 80 % de los swaps no tocan stablecoins.",
+    ),
 ) -> None:
     """Lee los swaps de unas wallets de Solana vía Helius y escribe el CSV de señales del backtest.
 
     La clave va en HELIUS_API_KEY (entorno o .env de --root), nunca en el YAML. Solo se escriben
-    los swaps valorables en dólares (stablecoin <-> token); el resto se omite y se cuenta.
+    los swaps valorables en dólares; el resto se omite y se cuenta por motivo.
+
+    Un swap es valorable si lleva una stablecoin (importe exacto) o, con --sol-quotes, si va
+    contra SOL (importe estimado con el precio de SOL de esa hora). Baja esas cotizaciones con
+    'fetch-quotes --symbol SOL/USDT' cubriendo el mismo periodo que --since.
 
     Códigos de salida: 0 todo leído; 1 nada que escribir o fallo general; 2 argumentos o clave
     inválidos; 3 lectura parcial (fichero escrito, pero falló una wallet o quedó recortada).
@@ -672,6 +682,25 @@ def fetch_solana_signals(
     except HeliusError as exc:
         raise _fail(f"error: {exc}", 2) from None
 
+    sol_price = None
+    if sol_quotes is not None:
+        # Se construye ANTES de pedir nada a Helius: un CSV sin cotizaciones de SOL haría
+        # cientos de peticiones para omitir luego todos los swaps por 'no_sol_price'.
+        try:
+            table = SolPriceTable(_read_quotes(sol_quotes))
+        except SolPriceError as exc:
+            raise _fail(f"error en las cotizaciones de SOL {sol_quotes}: {exc}", 2) from None
+        if not len(table):
+            raise _fail(
+                f"{sol_quotes} no trae ninguna cotización de SOL (se buscan los pares "
+                f"{', '.join(SOL_SYMBOLS)}); bájalas con 'fetch-quotes --symbol SOL/USDT'",
+                2,
+            )
+        sol_price = table.price_at
+        _say(cfg, f"{len(table)} cotizaciones de SOL cargadas de {sol_quotes}")
+    else:
+        _say(cfg, "sin --sol-quotes: los swaps contra SOL se omitirán (la mayoría, en Solana)")
+
     client = deps.solana_client if deps.solana_client is not None else make_solana_client()
     sleep = deps.sleep if deps.sleep is not None else time.sleep
     _say(cfg, f"leyendo swaps de {len(wallets)} wallet(s) desde {start.isoformat()}")
@@ -682,7 +711,10 @@ def fetch_solana_signals(
     problems = 0
     for address in wallets:
         try:
-            scan = fetch_wallet_swaps(client, address, api_key, since=start, token_map=tokens, sleep=sleep)
+            scan = fetch_wallet_swaps(
+                client, address, api_key, since=start, token_map=tokens,
+                sol_price=sol_price, sleep=sleep,
+            )
         except HeliusOrderError as exc:
             # Integridad de datos, no lectura parcial: no se escribe nada y no se sigue.
             raise _fail(f"{mode_prefix(cfg.mode)} | {address}: {exc}; no se escribe {out}") from None

@@ -30,6 +30,12 @@ Decisiones:
   stablecoin (1 USDC = 1 USD), el único que se conoce en dólares sin pedir precios. Las
   stablecoins se reconocen por la DIRECCIÓN DEL MINT, nunca por el símbolo (cualquiera puede
   acuñar un token que se llame "USDC").
+- **Swaps contra SOL**: en Solana casi nadie opera contra dólares. Una wallet real dio 545
+  swaps y el 81 % se omitía por ``no_stable`` porque iban token<->SOL. Si se pasa
+  ``sol_price`` (ver ``sol_price.py``), la pata de SOL se valora con el precio de SOL de ESA
+  hora y el swap sí da señal; sin él, se sigue omitiendo. El importe es entonces una
+  estimación a partir de un precio medido, no un importe exacto de stablecoin, y si hay
+  stablecoin en el swap manda siempre ella.
 - Los importes vienen en unidades mínimas: ``Decimal(str(valor)).scaleb(-decimals)``. Nunca float.
   La suposición se autoverifica: las unidades mínimas son SIEMPRE enteras, así que un
   ``tokenAmount`` con punto decimal, exponente o signo (lo que mandaría Helius si usara unidades
@@ -68,7 +74,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -106,6 +112,14 @@ LAMPORTS_PER_SOL_DECIMALS = 9
 # se omite como ``ambiguous``: sin patas que lo identifiquen, es mejor no emitirlo.
 DUST_SOL = Decimal("0.01")
 
+# Valoración de un swap contra SOL (ver adapters/solana/sol_price.py). La cotizada es siempre
+# USDC para que el mismo token sea UN instrumento pase el swap por USDC o por SOL: si una ruta
+# diera BONK/SOL y la otra BONK/USDC, la cartera partiría la misma posición en dos.
+SOL_QUOTE_SYMBOL = "USDC"
+# 8 decimales y A LA BAJA: un precio con muchos decimales daría un importe de 17 cifras, y
+# truncar nunca infla el tamaño que el trader movió de verdad.
+USD_PRECISION = Decimal("0.00000001")
+
 OMISSION_REASONS = {
     "no_stable": "swap sin stablecoin en ningún lado (token->token o SOL<->token): sin precio no se puede valorar",
     "stable_to_stable": "swap entre stablecoins: no es una posición que copiar",
@@ -115,6 +129,7 @@ OMISSION_REASONS = {
     "failed_tx": "transacción fallida en la cadena",
     "no_swap_event": "Helius no devolvió el evento de swap interpretado",
     "not_participant": "la wallet seguida no figura en las patas del swap",
+    "no_sol_price": "swap contra SOL sin precio de SOL para esa hora: baja las cotizaciones de SOL/USDT con fetch-quotes y cubre el periodo",
 }
 
 _WALLET_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -335,7 +350,10 @@ def make_signal_id(signature: str, wallet: str) -> str:
 
 
 def parse_swap(
-    tx: Any, wallet: str, token_map: Mapping[str, str] | None = None
+    tx: Any,
+    wallet: str,
+    token_map: Mapping[str, str] | None = None,
+    sol_price: Callable[[datetime], Decimal | None] | None = None,
 ) -> Signal | str:
     """Una transacción de Helius -> ``Signal``, o el código de por qué se omite.
 
@@ -366,22 +384,30 @@ def parse_swap(
     stable_got = [m for m in got if m in STABLE_MINTS]
     token_sold = [m for m in sold if m not in STABLE_MINTS]
     token_got = [m for m in got if m not in STABLE_MINTS]
+
     if not stable_sold and not stable_got:
-        return "no_stable"
-    if not token_sold and not token_got:
-        if stable_sold and stable_got:
-            return "stable_to_stable"
-        # polvo solo si no hay más de una stablecoin entre los dos lados; con dos, es ambiguo de verdad
-        return "below_dust" if dusted[0] and len(stable_sold) + len(stable_got) <= 1 else "ambiguous"
-
-    if len(stable_sold) == 1 and not token_sold and not stable_got and len(token_got) == 1:
-        side, stable, token, amounts = Side.BUY, stable_sold[0], token_got[0], sold
-    elif len(stable_got) == 1 and not token_got and not stable_sold and len(token_sold) == 1:
-        side, stable, token, amounts = Side.SELL, stable_got[0], token_sold[0], got
+        # Sin stablecoin, la única pata cuyo valor en dólares se puede conocer es la de SOL.
+        valued = _value_against_sol(sig, sold, got, token_sold, token_got, dusted, sol_price, moment)
+        if isinstance(valued, str):
+            return valued
+        side, token, usd, quote = valued
     else:
-        return "ambiguous"
+        if not token_sold and not token_got:
+            if stable_sold and stable_got:
+                return "stable_to_stable"
+            # polvo solo si no hay más de una stablecoin entre los dos lados; con dos, es ambiguo de verdad
+            return "below_dust" if dusted[0] and len(stable_sold) + len(stable_got) <= 1 else "ambiguous"
 
-    usd = amounts[stable]
+        if len(stable_sold) == 1 and not token_sold and not stable_got and len(token_got) == 1:
+            side, stable, token, amounts = Side.BUY, stable_sold[0], token_got[0], sold
+        elif len(stable_got) == 1 and not token_got and not stable_sold and len(token_sold) == 1:
+            side, stable, token, amounts = Side.SELL, stable_got[0], token_sold[0], got
+        else:
+            return "ambiguous"
+        # El importe de la stablecoin es EXACTO (1 USDC = 1 USD): tiene prioridad sobre cualquier
+        # estimación por precio de SOL, aunque el swap también lleve una pata de SOL.
+        usd, quote = amounts[stable], STABLE_MINTS[stable]
+
     if usd <= 0:
         return "zero_amount"
     base = (token_map or {}).get(token) or DEFAULT_SYMBOLS.get(token) or symbols.get(token) or token
@@ -389,11 +415,51 @@ def parse_swap(
         id=make_signal_id(sig, wallet),
         trader_id=wallet,
         market=Market.SOLANA,
-        symbol=f"{base}/{STABLE_MINTS[stable]}",
+        symbol=f"{base}/{quote}",
         side=side,
         timestamp=moment,
         trader_amount_usd=usd,
     )
+
+
+def _value_against_sol(
+    sig: str,
+    sold: dict[str, Decimal],
+    got: dict[str, Decimal],
+    token_sold: list[str],
+    token_got: list[str],
+    dusted: list[bool],
+    sol_price: Callable[[datetime], Decimal | None] | None,
+    moment: datetime,
+) -> tuple[Side, str, Decimal, str] | str:
+    """``(lado, mint del token, importe en USD, cotizada)`` de un swap token<->SOL, o por qué se omite.
+
+    El precio se pide para el MOMENTO DEL SWAP, no para la hora de la descarga: pedirlo para
+    "ahora" valoraría un swap de hace un mes al precio de hoy.
+    """
+    if sol_price is None:
+        return "no_stable"  # sin precios, el comportamiento es el de antes
+    sol_sold, sol_got = WSOL_MINT in sold, WSOL_MINT in got
+    other_sold = [m for m in token_sold if m != WSOL_MINT]
+    other_got = [m for m in token_got if m != WSOL_MINT]
+    if sol_sold and not other_sold and not sol_got and len(other_got) == 1:
+        side, sol_amount, token = Side.BUY, sold[WSOL_MINT], other_got[0]
+    elif sol_got and not other_got and not sol_sold and len(other_sold) == 1:
+        side, sol_amount, token = Side.SELL, got[WSOL_MINT], other_sold[0]
+    elif not sol_sold and not sol_got:
+        # Ninguna pata valorable: token->token, o la de SOL era polvo y ya se descartó.
+        return "below_dust" if dusted[0] else "no_stable"
+    else:
+        return "ambiguous"  # SOL en los dos lados, o varios tokens enfrente
+
+    price = sol_price(moment)
+    if price is None:
+        return "no_sol_price"
+    if not isinstance(price, Decimal) or not price.is_finite() or price <= 0:
+        # Un precio corrupto valoraría la señal con un tamaño falso; no se omite en silencio.
+        raise _fail(sig, f"el precio de SOL no es un Decimal finito y positivo: {price!r}")
+    usd = (sol_amount * price).quantize(USD_PRECISION, rounding=ROUND_DOWN)
+    return side, token, usd, SOL_QUOTE_SYMBOL
 
 
 # --- descarga ---
@@ -479,6 +545,7 @@ def fetch_wallet_swaps(
     *,
     since: datetime | None = None,
     token_map: Mapping[str, str] | None = None,
+    sol_price: Callable[[datetime], Decimal | None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     page_limit: int = DEFAULT_PAGE_LIMIT,
     max_requests: int = DEFAULT_MAX_REQUESTS,
@@ -521,7 +588,7 @@ def fetch_wallet_swaps(
             seen.add(sig)
             if since is not None and moment < since:
                 continue
-            result = parse_swap(tx, wallet, token_map)
+            result = parse_swap(tx, wallet, token_map, sol_price=sol_price)
             if isinstance(result, str):
                 scan.omitted[result] = scan.omitted.get(result, 0) + 1
             else:
@@ -547,6 +614,7 @@ class SolanaWalletSignalSource(SignalSource):
         *,
         client: Any = None,
         token_map: Mapping[str, str] | None = None,
+        sol_price: Callable[[datetime], Decimal | None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         page_limit: int = DEFAULT_PAGE_LIMIT,
         max_requests: int = DEFAULT_MAX_REQUESTS,
@@ -555,6 +623,7 @@ class SolanaWalletSignalSource(SignalSource):
         self._api_key = api_key
         self._client = client if client is not None else make_client()
         self._token_map = dict(token_map or {})
+        self._sol_price = sol_price
         self._sleep = sleep
         self._page_limit = page_limit
         self._max_requests = max_requests
@@ -570,7 +639,8 @@ class SolanaWalletSignalSource(SignalSource):
         for wallet in self._wallets:
             scan = fetch_wallet_swaps(
                 self._client, wallet, self._api_key, since=since, token_map=self._token_map,
-                sleep=self._sleep, page_limit=self._page_limit, max_requests=self._max_requests,
+                sol_price=self._sol_price, sleep=self._sleep, page_limit=self._page_limit,
+                max_requests=self._max_requests,
             )
             signals.extend(scan.signals)
             self.last_signatures.update(scan.signatures)

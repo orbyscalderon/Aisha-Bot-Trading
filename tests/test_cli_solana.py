@@ -209,3 +209,74 @@ def test_incomplete_read_still_exits_3(cfg_path, tmp_path):
         "--wallet", WALLET, "--since", SINCE, "--out", str(tmp_path / "o.csv"),
     ], obj=deps, env={"HELIUS_API_KEY": KEY})
     assert r.exit_code == 3
+
+
+# --- --sol-quotes: valorar los swaps contra SOL ---
+
+def sol_quotes_csv(tmp_path, *rows, name="sol.csv"):
+    """CSV con el mismo formato que escribe fetch-quotes: timestamp,symbol,price."""
+    path = tmp_path / name
+    lines = ["timestamp,symbol,price"]
+    for moment, symbol, price in rows:
+        lines.append(f"{moment.isoformat()},{symbol},{price}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def sol_swap(sig="x1", ts=T0):
+    """La wallet entrega 0,5 SOL nativo y recibe BONK: el caso que antes se perdía entero."""
+    return tx(sig, ts, native_in={"account": WALLET, "amount": "500000000"},
+              outs=[leg(BONK, "5000000000", 5)])
+
+
+def test_sin_sol_quotes_los_swaps_contra_sol_se_pierden_y_se_avisa(cfg_path, tmp_path):
+    """El aviso importa: con una wallet real esto son 4 de cada 5 operaciones, y el usuario
+    merece saber que el CSV vacío no es que el trader no opere."""
+    r, _ = run(cfg_path, tmp_path, {WALLET: [sol_swap()]})
+    assert r.exit_code == 1, r.output
+    assert "sin --sol-quotes" in r.output
+    assert "no_stable: 1" in r.output
+
+
+def test_con_sol_quotes_el_swap_contra_sol_se_valora(cfg_path, tmp_path):
+    quotes = sol_quotes_csv(
+        tmp_path, (datetime.fromtimestamp(T0 - 600, tz=timezone.utc), "SOL/USDT", "200"),
+    )
+    r, out = run(cfg_path, tmp_path, {WALLET: [sol_swap()]}, "--sol-quotes", str(quotes))
+    assert r.exit_code == 0, r.output
+    signals = CexCsvSignalSource(out).fetch_trades(None)
+    assert [s.side.value for s in signals] == ["buy"]
+    assert signals[0].trader_amount_usd == __import__("decimal").Decimal("100")
+    assert "1 cotizaciones de SOL cargadas" in r.output
+
+
+def test_un_swap_fuera_del_alcance_de_las_cotizaciones_se_cuenta_aparte(cfg_path, tmp_path):
+    """Una cotización de hace tres días no sirve para valorar el swap de hoy; se dice cuántos
+    swaps se quedaron sin precio en vez de valorarlos mal."""
+    vieja = datetime.fromtimestamp(T0 - 3 * 86400, tz=timezone.utc)
+    quotes = sol_quotes_csv(tmp_path, (vieja, "SOL/USDT", "200"))
+    r, _ = run(cfg_path, tmp_path, {WALLET: [sol_swap()]}, "--sol-quotes", str(quotes))
+    assert r.exit_code == 1, r.output
+    assert "no_sol_price: 1" in r.output
+    assert "fetch-quotes" in r.output  # el mensaje dice cómo arreglarlo
+
+
+def test_un_csv_sin_cotizaciones_de_sol_se_rechaza_antes_de_tocar_la_red(cfg_path, tmp_path):
+    """Si no hay precios de SOL, hacer 200 peticiones a Helius para omitirlo todo después es
+    gastar la cuota para nada."""
+    quotes = sol_quotes_csv(
+        tmp_path, (datetime.fromtimestamp(T0, tz=timezone.utc), "BONK/USDC", "0.00002"),
+    )
+    r, _ = run(cfg_path, tmp_path, {WALLET: [sol_swap()]}, "--sol-quotes", str(quotes))
+    assert r.exit_code == 2, r.output
+    assert "no trae ninguna cotización de SOL" in r.output
+    assert "leyendo swaps" not in r.output  # ni siquiera empezó
+
+
+def test_un_precio_de_sol_corrupto_para_el_comando(cfg_path, tmp_path):
+    quotes = sol_quotes_csv(
+        tmp_path, (datetime.fromtimestamp(T0, tz=timezone.utc), "SOL/USDT", "0"),
+    )
+    r, _ = run(cfg_path, tmp_path, {WALLET: [sol_swap()]}, "--sol-quotes", str(quotes))
+    assert r.exit_code == 2, r.output
+    assert "no positivo" in r.output
