@@ -52,6 +52,7 @@ from adapters.solana.prices import (
     SolanaPriceError,
     fetch_token_quotes,
 )
+from adapters.solana.screener import format_profile, profile_wallet
 from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
 from interfaces.chat.telegram_listener import TelegramListener
 from interfaces.dispatcher import Dispatcher
@@ -792,6 +793,78 @@ def mints_for_symbols(symbols: Iterable[str], token_map: Mapping[str, str]) -> d
         if mint:
             por_simbolo[symbol] = mint
     return por_simbolo
+
+
+@app.command("screen-solana-wallets")
+def screen_solana_wallets(
+    ctx: typer.Context,
+    config: Path = ConfigOpt,
+    root: Path = RootOpt,
+    wallet: list[str] = typer.Option(..., "--wallet", "-w", help="Wallet a examinar (repetible)."),
+    since: str = typer.Option(..., "--since", help="Inicio ISO-8601 con zona horaria."),
+    sol_quotes: Path | None = typer.Option(
+        None, "--sol-quotes", help="CSV con SOL/USDT, para valorar los swaps contra SOL."
+    ),
+    max_requests: int = typer.Option(
+        30, "--max-requests", min=1, help="Tope de peticiones a Helius POR wallet."
+    ),
+) -> None:
+    """Mide si unas wallets son traders antes de copiarlas, y descarta las que no lo son.
+
+    Responde a '¿es un trader o un bot de infraestructura? ¿mueve cantidades que valga la pena
+    copiar?'. NO responde a '¿habria ganado dinero copiarlo?': eso depende de TUS umbrales y lo
+    contesta el backtest.
+
+    Codigos de salida: 0 alguna wallet pasa la criba; 1 ninguna; 2 argumentos invalidos.
+    """
+    deps = _deps(ctx)
+    cfg = _load(config)
+    now = (deps.now or (lambda: datetime.now(timezone.utc)))()
+    start = _parse_aware(since, "--since")
+    if start >= now:
+        raise _fail("--since esta en el futuro", 2)
+    try:
+        wallets = [validate_wallet(w.strip()) for w in dict.fromkeys(wallet)]
+        api_key = load_api_key(os.environ, root)
+    except HeliusError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+
+    sol_price = None
+    if sol_quotes is not None:
+        try:
+            tabla = SolPriceTable(_read_quotes(sol_quotes))
+        except SolPriceError as exc:
+            raise _fail(f"error en las cotizaciones de SOL: {exc}", 2) from None
+        if not len(tabla):
+            raise _fail(f"{sol_quotes} no trae ninguna cotizacion de SOL", 2)
+        sol_price = tabla.price_at
+    else:
+        _say(cfg, "sin --sol-quotes: los swaps contra SOL no se valoran (la mayoria, en Solana)")
+
+    client = deps.solana_client if deps.solana_client is not None else make_solana_client()
+    sleep = deps.sleep if deps.sleep is not None else time.sleep
+    _say(cfg, f"examinando {len(wallets)} wallet(s) desde {start.isoformat()}")
+
+    candidatos = 0
+    for address in wallets:
+        try:
+            scan = fetch_wallet_swaps(
+                client, address, api_key, since=start, sol_price=sol_price,
+                sleep=sleep, max_requests=max_requests,
+            )
+        except HeliusError as exc:
+            typer.echo(f"{address}\n  no se pudo leer: {exc}\n")
+            continue
+        leidos = len(scan.signals) + sum(scan.omitted.values())
+        perfil = profile_wallet(address, scan.signals, leidos, scan.omitted, scan.complete)
+        sirve, _ = perfil.verdict()
+        candidatos += 1 if sirve else 0
+        typer.echo(format_profile(perfil))
+        typer.echo("")
+
+    _say(cfg, f"{candidatos} de {len(wallets)} pasan la criba")
+    if not candidatos:
+        raise _fail("ninguna wallet pasa la criba; no hay candidato que copiar")
 
 
 @app.command("fetch-solana-quotes")
