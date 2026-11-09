@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -57,6 +58,8 @@ TIMEOUT_SECONDS = 25.0
 JUPITER_BATCH = 50          # ids por petición
 DEFAULT_CACHE_SECONDS = 20
 HEADERS = {"Accept": "application/json", "User-Agent": "bot-copy-trading/1.0"}
+_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 
 class SolanaPriceError(Exception):
@@ -235,14 +238,35 @@ class JupiterPriceSource(MarketDataSource):
         self._cache: dict[str, Decimal] = {}
         self._cached_at: datetime | None = None
 
+    def mint_for(self, symbol: str) -> str | None:
+        """Mint de un símbolo: del mapa, o la propia base si ya ES una dirección de mint.
+
+        Las señales que genera ``parse_swap`` usan el mint como base cuando no hay mapeo
+        (``DezXAZ.../USDC``), así que resolverlo solo deja al bot operar sobre tokens nuevos
+        sin tener que apuntarlos a mano en ninguna parte.
+        """
+        conocido = self._mints.get(symbol)
+        if conocido:
+            return conocido
+        base = symbol.split("/", 1)[0].strip()
+        if _MINT_RE.match(base):
+            self._mints.setdefault(symbol, base)  # se recuerda para el siguiente refresco
+            return base
+        return None
+
     def get_quote(self, symbol: str) -> Quote:
-        mint = self._mints.get(symbol)
+        mint = self.mint_for(symbol)
         if mint is None:
             # Permanente: sin mint no se podrá valorar nunca, por muchas veces que se reintente.
             raise MarketUnpriceable(f"{symbol}: no está en el mapa de mints de Solana")
 
         ahora = self._now()
-        if self._cached_at is None or (ahora - self._cached_at).total_seconds() >= self._cache_seconds:
+        caducada = (
+            self._cached_at is None
+            or (ahora - self._cached_at).total_seconds() >= self._cache_seconds
+        )
+        # Un mint recien descubierto no esta en la cache aunque sea reciente: se refresca.
+        if caducada or mint not in self._cache:
             self._refresh(ahora)
         precio = self._cache.get(mint)
         if precio is None:
@@ -281,3 +305,47 @@ class JupiterPriceSource(MarketDataSource):
             "JupiterPriceSource solo lee precios. El capital lo aporta el envoltorio: "
             "PaperCapitalSource en simulado, y el adaptador de la wallet en real."
         )
+
+
+class LiveSolPrice:
+    """Precio de SOL de AHORA, para valorar los swaps que el bot acaba de leer.
+
+    El lector de wallets (``parse_swap``) pide el precio de SOL del momento del swap. En
+    backtest eso sale de una tabla histórica; en vivo no hay tabla, y pedir el histórico de
+    cada swap seria una llamada por señal.
+
+    La aproximación es usar el precio actual, y es razonable SOLO porque el ciclo de entrada
+    corre cada hora: los swaps que se valoran tienen minutos, no días. Pero la aproximación
+    tiene que estar acotada o deja de serlo: por encima de ``max_age`` no se devuelve precio y
+    el swap se omite como ``no_sol_price``. Valorar un swap de ayer al precio de hoy no es una
+    estimación, es inventarse el tamaño de la señal; SOL se movió de 118 a 89 USD en cinco
+    semanas.
+    """
+
+    def __init__(
+        self,
+        source: JupiterPriceSource,
+        *,
+        max_age: Any = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        from datetime import timedelta
+        self._source = source
+        self._max_age = max_age if max_age is not None else timedelta(hours=2)
+        self._now = now or (lambda: datetime.now(timezone.utc))
+
+    def __call__(self, moment: datetime) -> Decimal | None:
+        from datetime import timedelta
+        ahora = self._now()
+        if moment.tzinfo is None:
+            return None
+        # Un swap "del futuro" delata un reloj desajustado en alguna parte: no se valora.
+        if moment > ahora + timedelta(minutes=5):
+            return None
+        if ahora - moment > self._max_age:
+            return None
+        try:
+            return self._source.get_quote(f"{WSOL_MINT}/USDC").price
+        except QuoteUnavailable:
+            # Sin precio se omite el swap; nunca se inventa uno.
+            return None

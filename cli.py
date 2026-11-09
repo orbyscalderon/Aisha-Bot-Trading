@@ -46,7 +46,12 @@ from adapters.cex.history import (
     write_quotes_csv,
 )
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
-from adapters.solana.prices import SolanaPriceError, fetch_token_quotes
+from adapters.solana.prices import (
+    JupiterPriceSource,
+    LiveSolPrice,
+    SolanaPriceError,
+    fetch_token_quotes,
+)
 from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
 from interfaces.chat.telegram_listener import TelegramListener
 from interfaces.dispatcher import Dispatcher
@@ -57,6 +62,7 @@ from adapters.solana.source import (
     OMISSION_REASONS,
     HeliusError,
     HeliusOrderError,
+    SolanaWalletSignalSource,
     fetch_wallet_swaps,
     load_api_key,
     load_token_map,
@@ -116,6 +122,7 @@ class CliDeps:
     solana_client: Any = None  # cliente httpx de fetch-solana-signals
     telegram_client: Any = None  # cliente httpx del control por Telegram
     gecko_client: Any = None  # cliente httpx de fetch-solana-quotes
+    jupiter_client: Any = None  # cliente httpx de los precios en vivo de Solana
 
 
 # --- composición ---
@@ -486,6 +493,11 @@ def run(
     signals: Path | None = typer.Option(
         None, "--signals", help="CSV de señales: timestamp,trader_id,symbol,side,amount_usd."
     ),
+    solana_wallet: list[str] = typer.Option(
+        [], "--solana-wallet", "-w",
+        help="Wallet de Solana a copiar EN VIVO (repetible). Alternativa a --signals: "
+             "lee los swaps de Helius en cada ciclo en vez de un CSV estático.",
+    ),
     root: Path = RootOpt,
     once: bool = typer.Option(False, "--once", help="Un ciclo de entrada y uno de salida, y termina."),
     exchange: str = typer.Option(DEFAULT_EXCHANGE, "--exchange", help="Exchange (ccxt) de las cotizaciones."),
@@ -502,8 +514,15 @@ def run(
             "Usa mode: paper para operar en simulado.",
             3,
         )
-    if signals is None:
-        raise _fail("falta --signals: indica el CSV de señales a copiar", 2)
+    if signals is None and not solana_wallet:
+        raise _fail(
+            "falta la fuente de señales: usa --signals con un CSV, o --solana-wallet "
+            "para copiar wallets en vivo", 2,
+        )
+    if signals is not None and solana_wallet:
+        # Mezclarlas silenciosamente daría dos cursores sobre la misma base y nadie sabría
+        # de dónde salió cada posición.
+        raise _fail("usa --signals o --solana-wallet, no las dos a la vez", 2)
     try:
         entry_trigger = CronTrigger.from_crontab(cfg.cadence.entry_cron, timezone=timezone.utc)
     except ValueError as exc:
@@ -512,26 +531,56 @@ def run(
     # Validar el CSV AL ARRANCAR. `CexCsvSignalSource` lo lee perezosamente dentro del
     # ciclo, así que un fichero ausente o malformado saldría como traza cruda a mitad de
     # ejecución en vez de como mensaje al empezar.
-    _read_signals(signals)
+    if signals is not None:
+        _read_signals(signals)
+
+    # La fuente en vivo se monta ANTES de tocar el disco: una wallet mal escrita o una
+    # clave ausente deben parar aquí, no con media base de datos creada.
+    live_source = None
+    live_data = None
+    if solana_wallet:
+        try:
+            wallets = [validate_wallet(w.strip()) for w in dict.fromkeys(solana_wallet)]
+            api_key = load_api_key(os.environ, root)
+        except HeliusError as exc:
+            raise _fail(f"error: {exc}", 2) from None
+        # Jupiter sirve las DOS cosas: el precio de los tokens para el motor y el de SOL
+        # para valorar los swaps. Una fuente menos que pueda discrepar consigo misma.
+        # El MISMO reloj que el resto del comando. Con el reloj real aquí dentro, un swap
+        # recién leído parecería viejísimo en cuanto el reloj del motor no fuese el de la
+        # máquina, y se descartaría por antigüedad sin que nada lo explicase.
+        reloj = deps.now or (lambda: datetime.now(timezone.utc))
+        live_data = JupiterPriceSource({}, client=deps.jupiter_client, now=reloj)
+        live_source = SolanaWalletSignalSource(
+            wallets, api_key, client=deps.solana_client,
+            sol_price=LiveSolPrice(live_data, now=reloj),
+            sleep=deps.sleep if deps.sleep is not None else time.sleep,
+        )
 
     _say(cfg, f"arrancando en simulado (config {cfg.fingerprint()[:12]})")
     try:
         engine, notifier, audit = _build(
-            cfg, root, exchange_id=exchange, data_source=deps.data_source,
+            cfg, root, exchange_id=exchange,
+            data_source=deps.data_source if deps.data_source is not None else live_data,
             notifier=deps.notifier, paper_capital=_parse_capital(capital),
         )
     except InvalidExchange as exc:
         raise _fail(str(exc), 2) from None
     warn_if_no_protections(cfg, notifier)
     warn_if_copy_sell_primary(cfg, notifier)
-    source = CexCsvSignalSource(signals)
+    source = live_source if live_source is not None else CexCsvSignalSource(signals)
+    if live_source is not None:
+        _say(cfg, f"copiando EN VIVO {len(live_source.list_followed())} wallet(s) de Solana")
     entry_job, exit_job = build_jobs(
         engine, source, notifier=notifier, audit=audit,
         lock_timeout=exit_lock_timeout(cfg.cadence.exit_interval_seconds),
     )
 
     if once:
-        now = datetime.now(timezone.utc)
+        # El reloj inyectado, como en el resto de comandos. En producción deps.now es None y
+        # esto es datetime.now(); usarlo directamente dejaba --once sin forma de probarse con
+        # un reloj simulado, que es justo lo que hace falta para verificar el cursor.
+        now = (deps.now or (lambda: datetime.now(timezone.utc)))()
         entry = engine.run_entry_cycle(source, now)
         _say(cfg, f"ciclo de entrada: {len(entry.opened)} abiertas, {len(entry.rejected)} rechazadas")
         closed = engine.run_exit_cycle(now)

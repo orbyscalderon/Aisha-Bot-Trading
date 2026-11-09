@@ -308,3 +308,71 @@ def test_si_el_limite_no_cede_se_dice_cuantos_intentos_hubo():
     server = GeckoConFallos([429] * 10, velas=[vela(T0, 1.0)])
     with pytest.raises(SolanaPriceError, match="4 intentos"):
         traer(server, sleep=lambda _s: None)
+
+
+# --- resolver el mint desde el propio simbolo ---
+
+def test_un_simbolo_cuya_base_ya_es_un_mint_se_resuelve_solo():
+    """parse_swap genera 'DezXAZ.../USDC' cuando no hay mapeo. Exigir apuntar cada token a
+    mano dejaria al bot ciego ante cualquier token nuevo que el trader compre."""
+    q = Jup({BONK: 1.5}).source().get_quote(f"{BONK}/USDC")
+    assert q.price == Decimal("1.5")
+
+
+def test_una_base_que_no_es_un_mint_sigue_sin_poder_valorarse():
+    with pytest.raises(MarketUnpriceable):
+        Jup({BONK: 1.0}).source().get_quote("NOSOYUNMINT/USDC")
+
+
+def test_un_mint_descubierto_despues_tambien_se_consulta():
+    """Si el refresco solo pidiera los mints conocidos al arrancar, el token nuevo no tendria
+    precio hasta que caducara la cache: el bot abriria a ciegas o no abriria."""
+    jup = Jup({BONK: 1.0, WIF: 2.0})
+    s = jup.source()
+    s.get_quote("BONK/USDC")                     # primera consulta
+    assert s.get_quote(f"{WIF}/USDC").price == Decimal("2")
+
+
+# --- precio de SOL en vivo ---
+
+from adapters.solana.prices import WSOL_MINT, LiveSolPrice  # noqa: E402
+
+
+def sol_live(precio=100.0, max_age=None, ahora=AHORA):
+    jup = Jup({WSOL_MINT: precio})
+    fuente = JupiterPriceSource(
+        {}, client=httpx.Client(transport=httpx.MockTransport(jup)), now=lambda: ahora
+    )
+    return LiveSolPrice(fuente, max_age=max_age, now=lambda: ahora), jup
+
+
+def test_un_swap_reciente_se_valora_al_precio_actual_de_sol():
+    precio, _ = sol_live(95.5)
+    assert precio(AHORA - timedelta(minutes=20)) == Decimal("95.5")
+
+
+def test_un_swap_demasiado_viejo_no_se_valora():
+    """SOL paso de 118 a 89 USD en cinco semanas. Valorar un swap de ayer al precio de hoy no
+    es estimar: es inventarse el tamano de la senal."""
+    precio, _ = sol_live()
+    assert precio(AHORA - timedelta(hours=3)) is None
+
+
+def test_el_limite_de_antiguedad_es_configurable():
+    precio, _ = sol_live(max_age=timedelta(minutes=10))
+    assert precio(AHORA - timedelta(minutes=5)) is not None
+    assert precio(AHORA - timedelta(minutes=11)) is None
+
+
+def test_un_swap_del_futuro_no_se_valora():
+    """Delata un reloj desajustado en alguna parte; mejor omitir que operar sobre eso."""
+    precio, _ = sol_live()
+    assert precio(AHORA + timedelta(hours=1)) is None
+
+
+def test_si_jupiter_falla_no_se_inventa_un_precio():
+    jup = Jup(error=httpx.ConnectError("sin red"))
+    fuente = JupiterPriceSource(
+        {}, client=httpx.Client(transport=httpx.MockTransport(jup)), now=lambda: AHORA
+    )
+    assert LiveSolPrice(fuente, now=lambda: AHORA)(AHORA - timedelta(minutes=1)) is None
