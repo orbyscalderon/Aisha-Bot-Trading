@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -27,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 import typer
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -45,6 +46,7 @@ from adapters.cex.history import (
     write_quotes_csv,
 )
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
+from adapters.solana.prices import SolanaPriceError, fetch_token_quotes
 from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
 from interfaces.chat.telegram_listener import TelegramListener
 from interfaces.dispatcher import Dispatcher
@@ -113,6 +115,7 @@ class CliDeps:
     now: Callable[[], datetime] | None = None  # reloj de fetch-quotes y fetch-solana-signals
     solana_client: Any = None  # cliente httpx de fetch-solana-signals
     telegram_client: Any = None  # cliente httpx del control por Telegram
+    gecko_client: Any = None  # cliente httpx de fetch-solana-quotes
 
 
 # --- composición ---
@@ -135,6 +138,12 @@ class PaperCapitalSource(MarketDataSource):
 
     def get_balance(self) -> Decimal:
         return Portfolio(self._repo).total_equity_usd(self._inner.get_quote, self._capital)
+
+
+def make_gecko_client() -> Any:
+    import httpx
+    from adapters.solana.prices import TIMEOUT_SECONDS as _GECKO_TIMEOUT
+    return httpx.Client(timeout=_GECKO_TIMEOUT)
 
 
 def _make_notifier(mode: Mode) -> Notifier:
@@ -713,6 +722,106 @@ def fetch_quotes(
     _say(cfg, f"{len(quotes)} velas, de {first.isoformat()} a {last.isoformat()}, escritas en {out}")
     if problems:
         raise _fail(f"{mode_prefix(cfg.mode)} | descarga parcial: {problems} problema(s) arriba", 3)
+
+
+_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def mints_for_symbols(symbols: Iterable[str], token_map: Mapping[str, str]) -> dict[str, str]:
+    """``{simbolo: mint}`` de los simbolos de Solana que se pueden resolver.
+
+    El simbolo de una senal es ``BASE/USDC``. La base es el mint cuando no habia mapeo (es lo
+    que hace ``parse_swap``), o el nombre legible cuando si lo habia; por eso se mira tambien
+    el mapeo a la inversa. Lo que no se resuelve se devuelve aparte para decirlo, nunca se
+    adivina: bajar el precio del token equivocado seria peor que no bajarlo.
+    """
+    por_simbolo: dict[str, str] = {}
+    inverso = {sym: mint for mint, sym in token_map.items()}
+    for symbol in symbols:
+        base = symbol.split("/", 1)[0].strip()
+        mint = inverso.get(base) or (base if _MINT_RE.match(base) else None)
+        if mint:
+            por_simbolo[symbol] = mint
+    return por_simbolo
+
+
+@app.command("fetch-solana-quotes")
+def fetch_solana_quotes(
+    ctx: typer.Context,
+    config: Path = ConfigOpt,
+    signals: Path = typer.Option(..., "--signals", help="CSV de senales del que sacar los tokens."),
+    since: str = typer.Option(..., "--since", help="Inicio ISO-8601 con zona horaria."),
+    out: Path = typer.Option(..., "--out", help="CSV de salida: timestamp,symbol,price."),
+    token_map: Path | None = typer.Option(
+        None, "--token-map", help="El MISMO mapeo que usaste en fetch-solana-signals."
+    ),
+    timeframe: str = typer.Option("hour", "--timeframe", help="hour, day o minute."),
+) -> None:
+    """Baja el historico de precios de los tokens de Solana que aparecen en un CSV de senales.
+
+    Binance no cotiza BONK ni WIF, asi que fetch-quotes no sirve para ellos. Aqui los precios
+    salen de GeckoTerminal, del pool con mas liquidez de cada token.
+
+    Codigos de salida: 0 todo bajado; 1 nada que escribir o fallo general; 2 argumentos
+    invalidos; 3 descarga parcial (fichero escrito, pero fallo algun token).
+    """
+    deps = _deps(ctx)
+    cfg = _load(config)
+    now = (deps.now or (lambda: datetime.now(timezone.utc)))()
+    start = _parse_aware(since, "--since")
+    if start >= now:
+        raise _fail("--since esta en el futuro: no hay precios que bajar", 2)
+    try:
+        tokens = load_token_map(token_map) if token_map is not None else {}
+    except HeliusError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+
+    señales = _read_signals(signals)
+    simbolos = sorted({s.symbol for s in señales})
+    if not simbolos:
+        raise _fail(f"{signals} no tiene ninguna senal de la que sacar tokens")
+
+    por_simbolo = mints_for_symbols(simbolos, tokens)
+    sin_resolver = [s for s in simbolos if s not in por_simbolo]
+    if sin_resolver:
+        _say(cfg, f"{len(sin_resolver)} simbolo(s) sin mint conocido, se omiten: {', '.join(sin_resolver[:5])}")
+        _say(cfg, "  (usa --token-map con el mismo mapeo que en fetch-solana-signals)")
+    if not por_simbolo:
+        raise _fail("ningun simbolo se pudo resolver a un mint de Solana; no se escribe nada")
+
+    client = deps.gecko_client if deps.gecko_client is not None else make_gecko_client()
+    sleep = deps.sleep if deps.sleep is not None else time.sleep
+    _say(cfg, f"bajando {timeframe} de {len(por_simbolo)} token(s) desde {start.isoformat()}")
+
+    quotes: list[Quote] = []
+    problemas = 0
+    for i, (symbol, mint) in enumerate(sorted(por_simbolo.items())):
+        if i:
+            sleep(2.1)  # el plan gratuito de GeckoTerminal admite ~30 peticiones/minuto
+        try:
+            nuevas = fetch_token_quotes(
+                client, mint, symbol, since=start, until=now,
+                timeframe=timeframe, now=now, sleep=sleep,
+            )
+        except SolanaPriceError as exc:
+            problemas += 1
+            _say(cfg, f"{symbol}: fallo la descarga ({exc}); se sigue con los demas")
+            continue
+        _say(cfg, f"{symbol}: {len(nuevas)} velas")
+        if not nuevas:
+            problemas += 1
+        quotes.extend(nuevas)
+
+    if not quotes:
+        raise _fail(f"{mode_prefix(cfg.mode)} | no se bajo ninguna cotizacion; no se escribe {out}")
+    quotes.sort(key=lambda q: (q.timestamp, q.symbol))
+    try:
+        write_quotes_csv(out, quotes)
+    except Exception as exc:  # noqa: BLE001
+        raise _fail(f"{mode_prefix(cfg.mode)} | no se pudo escribir {out}: {type(exc).__name__}") from None
+    _say(cfg, f"{len(quotes)} cotizaciones escritas en {out}")
+    if problemas:
+        raise _fail(f"{mode_prefix(cfg.mode)} | descarga parcial: {problemas} problema(s) arriba", 3)
 
 
 @app.command("fetch-solana-signals")
