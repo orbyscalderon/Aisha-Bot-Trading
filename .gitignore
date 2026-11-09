@@ -19,3 +19,6 @@ ejemplos/*.html
 logs/
 *.db-shm
 *.db-wal
+
+# Barridos acumulados: datos locales, cambian cada pocas horas.
+datos/

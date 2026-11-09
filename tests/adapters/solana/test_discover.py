@@ -194,3 +194,76 @@ def test_una_fecha_ilegible_no_rompe_la_wallet():
     c = gecko([pool("a", "A", "100000")], {"a": [trade(W1, "100", ts="no-es-una-fecha")]})
     leads, _ = descubre(c)
     assert leads[0].primera is None and leads[0].intercambios == 1
+
+
+# --- el historial entre barridos ---
+# Un solo barrido mira minutos de los pools activos: selecciona bots por construccion, por
+# mucho que se afinen los umbrales. Esto es lo que corrige ese sesgo.
+
+from adapters.solana.discover import WalletHistory, format_history, merge_history
+
+AYER = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
+HOY = datetime(2026, 11, 9, 12, tzinfo=timezone.utc)
+
+
+def lead(wallet=W1, mediana="100", pools=("A",)):
+    return WalletLead(wallet, 2, pools, 1, 1, Decimal(mediana), Decimal(mediana))
+
+
+def test_el_primer_barrido_crea_la_entrada():
+    h = merge_history([], [lead()], HOY)
+    assert len(h) == 1 and h[0].barridos == 1
+    assert h[0].primera == HOY and h[0].ultima == HOY
+
+
+def test_volver_a_verla_suma_un_barrido():
+    previos = merge_history([], [lead()], AYER)
+    h = merge_history(previos, [lead()], HOY)
+    assert h[0].barridos == 2 and h[0].primera == AYER and h[0].ultima == HOY
+
+
+def test_el_contador_sube_UNA_vez_por_barrido_no_por_intercambio():
+    """Contar intercambios devolveria el sesgo que esto corrige: lo que se mide es la
+    persistencia en el tiempo, no la velocidad."""
+    activa = WalletLead(W1, 500, ("A", "B"), 250, 250, Decimal("100"), Decimal("900"))
+    assert merge_history([], [activa], HOY)[0].barridos == 1
+
+
+def test_una_wallet_nueva_no_borra_las_anteriores():
+    previos = merge_history([], [lead(W1)], AYER)
+    h = merge_history(previos, [lead(W2)], HOY)
+    assert {x.wallet for x in h} == {W1, W2}
+
+
+def test_se_guarda_el_MAYOR_importe_mediano_visto():
+    """Quedarse con el ultimo barrido borraria de que tamano es capaz de operar por un dia
+    flojo cualquiera."""
+    previos = merge_history([], [lead(mediana="5000")], AYER)
+    h = merge_history(previos, [lead(mediana="80")], HOY)
+    assert h[0].mediana_usd == Decimal("5000")
+
+
+def test_los_pools_se_acumulan_sin_repetirse():
+    previos = merge_history([], [lead(pools=("A", "B"))], AYER)
+    h = merge_history(previos, [lead(pools=("B", "C"))], HOY)
+    assert h[0].pools == ("A", "B", "C")
+
+
+def test_se_ordena_por_numero_de_barridos():
+    previos = merge_history([], [lead(W1), lead(W2, "9000")], AYER)
+    h = merge_history(previos, [lead(W1)], HOY)
+    assert h[0].wallet == W1, "2 barridos pesa mas que un importe grande en uno solo"
+
+
+def test_los_dias_cubiertos_se_calculan_entre_el_primer_y_el_ultimo_barrido():
+    previos = merge_history([], [lead()], AYER)
+    assert merge_history(previos, [lead()], HOY)[0].dias == Decimal("1")
+
+
+def test_un_solo_barrido_da_cero_dias_no_un_error():
+    assert merge_history([], [lead()], HOY)[0].dias == Decimal("0")
+
+
+def test_el_texto_del_historial_cabe_en_una_linea():
+    h = WalletHistory(W1, 5, AYER, HOY, Decimal("100"), ("A",))
+    assert "\n" not in format_history(h) and "5 barridos" in format_history(h)

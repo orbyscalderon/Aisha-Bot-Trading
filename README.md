@@ -180,7 +180,7 @@ wallet que se probó parecía un trader y era infraestructura que pagaba comisio
 
 ```bash
 # 1. ¿quién está operando ahora? (GeckoTerminal, gratis, sin clave)
-copybot discover-solana-wallets --out candidatas.txt
+copybot discover-solana-wallets --historial barridos.csv
 
 # 2. ¿cuáles son traders de verdad? (Helius; descarta bots e infraestructura)
 copybot fetch-quotes -s SOL/USDT --since 2026-11-01T00:00:00+00:00 --out sol.csv
@@ -194,6 +194,27 @@ copybot backtest --signals senales.csv --quotes precios.csv
 # 4. copiarla en vivo
 copybot run --solana-wallet <dirección>
 ```
+
+### Un solo barrido selecciona bots
+
+Esto no es un defecto de los umbrales, es el método: el barrido mira los últimos ~300
+intercambios de cada pool, que en los activos son **minutos**. Quien opera dos veces al día no
+aparece casi nunca; quien opera sin parar aparece siempre.
+
+Lo que sí funciona es repetir el barrido durante días contra el mismo historial:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\instalar-barrido.ps1
+```
+
+Registra un barrido cada 4 horas (solo lectura: no opera, no toca la base de datos del bot y
+no gasta peticiones de Helius). Pasados unos días:
+
+```bash
+copybot discover-solana-wallets --historial datos/barridos.csv --min-barridos 8 --out candidatas.txt
+```
+
+"Visto en 8 barridos de 4 días" no se puede fingir operando rápido: hay que seguir ahí mañana.
 
 **Lo que la criba mide** (todo sale de swaps reales, nada se estima): tamaño mediano de las
 operaciones, cuántos tokens distintos toca, compras frente a ventas, ritmo de operaciones,

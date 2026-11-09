@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Sequence
 
@@ -226,6 +226,71 @@ def discover_wallets(
         ))
     leads.sort(key=lambda l: (l.mediana_usd, l.intercambios), reverse=True)
     return leads, recuento
+
+
+@dataclass(frozen=True)
+class WalletHistory:
+    """Una dirección a lo largo de VARIOS barridos separados en el tiempo.
+
+    POR QUÉ HACE FALTA. Un barrido mira los últimos ~300 intercambios de cada pool, que en
+    los pools activos son minutos. Quien opera dos veces al día no aparece casi nunca; quien
+    opera sin parar aparece siempre. Es decir: **un solo barrido selecciona bots por
+    construcción**, por mucho que se afinen los umbrales.
+
+    Repetir el barrido cada varias horas corrige justo eso. "Visto en 5 barridos de 5 días"
+    no se puede fingir operando rápido: hay que seguir ahí al día siguiente.
+    """
+
+    wallet: str
+    barridos: int
+    primera: datetime
+    ultima: datetime
+    mediana_usd: Decimal
+    pools: tuple[str, ...]
+
+    @property
+    def dias(self) -> Decimal:
+        """Días entre el primer y el último barrido en que se le vio."""
+        return Decimal(str(round((self.ultima - self.primera) / timedelta(days=1), 4)))
+
+
+def merge_history(
+    previos: Iterable[WalletHistory], leads: Iterable[WalletLead], ahora: datetime
+) -> list[WalletHistory]:
+    """Suma este barrido al histórico. Ordena por barridos y, a igualdad, por importe.
+
+    El contador sube UNA vez por barrido, no una por intercambio: lo que se quiere medir es
+    la persistencia en el tiempo, y contar intercambios devolvería el sesgo que esto corrige.
+    """
+    por_wallet = {h.wallet: h for h in previos}
+    for lead in leads:
+        anterior = por_wallet.get(lead.wallet)
+        if anterior is None:
+            por_wallet[lead.wallet] = WalletHistory(
+                wallet=lead.wallet, barridos=1, primera=ahora, ultima=ahora,
+                mediana_usd=lead.mediana_usd, pools=lead.pools,
+            )
+            continue
+        por_wallet[lead.wallet] = WalletHistory(
+            wallet=lead.wallet,
+            barridos=anterior.barridos + 1,
+            primera=min(anterior.primera, ahora),
+            ultima=max(anterior.ultima, ahora),
+            # El mayor importe mediano visto: lo que importa es de qué tamaño es capaz de
+            # operar, y quedarse con el último barrido borraría un día flojo cualquiera.
+            mediana_usd=max(anterior.mediana_usd, lead.mediana_usd),
+            pools=tuple(sorted(set(anterior.pools) | set(lead.pools))),
+        )
+    salida = list(por_wallet.values())
+    salida.sort(key=lambda h: (h.barridos, h.mediana_usd), reverse=True)
+    return salida
+
+
+def format_history(h: WalletHistory) -> str:
+    return (
+        f"  {h.wallet}  {h.barridos:>3} barridos en {h.dias:>5.1f} dias  "
+        f"mediana {h.mediana_usd:>10.2f} USD  {len(h.pools)} pools"
+    )
 
 
 def format_lead(l: WalletLead) -> str:

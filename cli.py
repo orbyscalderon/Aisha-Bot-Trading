@@ -58,8 +58,11 @@ from adapters.solana.discover import (
     DEFAULT_MIN_LIQUIDITY_USD as DISCOVER_MIN_LIQUIDITY_USD,
     DEFAULT_MIN_POOLS as DISCOVER_MIN_POOLS,
     DEFAULT_MIN_TRADE_USD as DISCOVER_MIN_TRADE_USD,
+    WalletHistory,
     discover_wallets,
+    format_history,
     format_lead,
+    merge_history,
 )
 from adapters.solana.screener import format_profile, profile_wallet
 from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
@@ -954,6 +957,54 @@ def screen_solana_wallets(
         raise _fail("ninguna wallet pasa la criba; no hay candidato que copiar")
 
 
+#: Columnas del historial de barridos. Es un CSV y no un formato propio para que se pueda
+#: abrir en cualquier sitio y comprobar a mano lo que el comando dice haber visto.
+_HISTORIAL_COLUMNAS = ("wallet", "barridos", "primera", "ultima", "mediana_usd", "pools")
+
+
+def _read_history(path: Path) -> list[WalletHistory]:
+    """Historial de barridos previos, o vacio si aun no existe.
+
+    Una fila ilegible PARA el comando en vez de ignorarse: perder barridos acumulados en
+    silencio haria que 'visto en 5 barridos' significara otra cosa sin que nadie se entere.
+    """
+    if not path.exists():
+        return []
+    salida: list[WalletHistory] = []
+    with path.open(newline="", encoding="utf-8") as fh:
+        lector = csv.DictReader(fh)
+        if lector.fieldnames is None or tuple(lector.fieldnames) != _HISTORIAL_COLUMNAS:
+            raise ValueError(
+                f"cabecera inesperada: se esperaba {','.join(_HISTORIAL_COLUMNAS)}"
+            )
+        for numero, fila in enumerate(lector, start=2):
+            try:
+                salida.append(WalletHistory(
+                    wallet=validate_wallet((fila["wallet"] or "").strip()),
+                    barridos=int(fila["barridos"]),
+                    primera=_parse_aware(fila["primera"], "primera"),
+                    ultima=_parse_aware(fila["ultima"], "ultima"),
+                    mediana_usd=Decimal(fila["mediana_usd"]),
+                    pools=tuple(p for p in (fila["pools"] or "").split("|") if p),
+                ))
+            except (HeliusError, InvalidOperation, KeyError, TypeError, ValueError,
+                    typer.Exit) as exc:
+                raise ValueError(f"fila {numero} ilegible: {exc}") from None
+    return salida
+
+
+def _write_history(path: Path, historial: Iterable[WalletHistory]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        escritor = csv.writer(fh)
+        escritor.writerow(_HISTORIAL_COLUMNAS)
+        for h in historial:
+            escritor.writerow([
+                h.wallet, h.barridos, h.primera.isoformat(), h.ultima.isoformat(),
+                f"{h.mediana_usd:.2f}", "|".join(h.pools),
+            ])
+
+
 @app.command("discover-solana-wallets")
 def discover_solana_wallets(
     ctx: typer.Context,
@@ -977,6 +1028,16 @@ def discover_solana_wallets(
         str(DISCOVER_MIN_LIQUIDITY_USD), "--min-liquidez",
         help="Liquidez minima del pool en USD.",
     ),
+    historial: Path | None = typer.Option(
+        None, "--historial",
+        help="CSV que ACUMULA barridos. Repite el comando cada pocas horas contra el mismo "
+             "fichero: quien siga apareciendo dias despues es el candidato de verdad.",
+    ),
+    min_barridos: int = typer.Option(
+        1, "--min-barridos", min=1,
+        help="Solo lista (y escribe en --out) a quien se haya visto en al menos N barridos. "
+             "Necesita --historial.",
+    ),
     limit: int = typer.Option(25, "--limit", min=1, help="Cuantas direcciones mostrar."),
 ) -> None:
     """Busca wallets que esten operando AHORA en los pools con liquidez de Solana.
@@ -989,10 +1050,21 @@ def discover_solana_wallets(
     operaciones al dia, que es un artefacto de la division) y solo se ve una cara del pool, no
     la cartera. Quien juzga es la criba, con el historial completo de Helius.
 
+    UN SOLO BARRIDO SELECCIONA BOTS, por construccion: mira los ultimos ~300 intercambios de
+    cada pool, que en los activos son minutos, asi que quien opera dos veces al dia no aparece
+    casi nunca y quien opera sin parar aparece siempre. Eso NO se arregla afinando umbrales.
+    Se arregla con --historial: repite el barrido cada pocas horas contra el mismo fichero y
+    filtra por --min-barridos. "Visto en 5 barridos de 5 dias" no se puede fingir operando
+    rapido; hay que seguir ahi al dia siguiente.
+
     Usa GeckoTerminal: gratis y sin clave. No gasta peticiones de Helius.
 
-    El paso siguiente es siempre:
-      python -m cli discover-solana-wallets --out candidatas.txt
+    El flujo util es:
+      # cada pocas horas (p. ej. una tarea programada)
+      python -m cli discover-solana-wallets --historial barridos.csv
+      # cuando haya varios dias acumulados
+      python -m cli discover-solana-wallets --historial barridos.csv --min-barridos 5 \
+          --out candidatas.txt
       python -m cli screen-solana-wallets -w <direccion> --since <fecha> --sol-quotes <csv>
 
     Codigos de salida: 0 hay direcciones; 1 ninguna; 2 argumentos invalidos.
@@ -1006,7 +1078,12 @@ def discover_solana_wallets(
         raise _fail("--min-operacion y --min-liquidez tienen que ser numeros", 2) from None
     if minimo <= 0 or liquidez <= 0:
         raise _fail("--min-operacion y --min-liquidez tienen que ser mayores que cero", 2)
+    if min_barridos > 1 and historial is None:
+        # Sin historial, "visto en 3 barridos" no se puede saber: solo hay uno. Decirlo es
+        # mejor que filtrar por un numero que siempre vale 1 y devolver una lista vacia.
+        raise _fail("--min-barridos necesita --historial: con un solo barrido todos valen 1", 2)
 
+    now = (deps.now or (lambda: datetime.now(timezone.utc)))()
     client = deps.gecko_client if deps.gecko_client is not None else make_gecko_client()
     sleep = deps.sleep if deps.sleep is not None else time.sleep
     _say(cfg, f"recorriendo hasta {max_pools} pools con mas de {liquidez} USD de liquidez")
@@ -1032,20 +1109,45 @@ def discover_solana_wallets(
         )
 
     typer.echo("")
-    for lead in leads[:limit]:
-        typer.echo(format_lead(lead))
+    elegidas = [l.wallet for l in leads]
+
+    if historial is None:
+        for lead in leads[:limit]:
+            typer.echo(format_lead(lead))
+    else:
+        try:
+            previos = _read_history(historial)
+        except ValueError as exc:
+            raise _fail(f"error leyendo {historial}: {exc}", 2) from None
+        acumulado = merge_history(previos, leads, now)
+        _write_history(historial, acumulado)
+        persistentes = [h for h in acumulado if h.barridos >= min_barridos]
+        typer.echo(
+            f"historial: {len(acumulado)} direcciones en total, "
+            f"{len(persistentes)} vistas en {min_barridos}+ barridos"
+        )
+        typer.echo("")
+        for h in persistentes[:limit]:
+            typer.echo(format_history(h))
+        elegidas = [h.wallet for h in persistentes]
+        if min_barridos == 1 and max(( h.barridos for h in acumulado), default=0) < 2:
+            typer.echo("")
+            typer.echo(
+                "Este es el primer barrido, asi que todos valen 1 y la lista no dice nada aun. "
+                "Repitelo cada pocas horas y filtra con --min-barridos."
+            )
     typer.echo("")
 
     if out is not None:
         # Solo las direcciones: el fichero esta hecho para encadenarlo con la criba, no para
         # leerlo. Lo que se mide aqui no sirve para decidir y guardarlo invitaria a usarlo.
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("\n".join(l.wallet for l in leads) + "\n", encoding="utf-8")
-        typer.echo(f"{len(leads)} direcciones en {out}")
+        out.write_text("\n".join(elegidas) + "\n", encoding="utf-8")
+        typer.echo(f"{len(elegidas)} direcciones en {out}")
 
     _say(
         cfg,
-        f"{len(leads)} direcciones por examinar. NINGUNA esta aprobada: pasalas por "
+        f"{len(elegidas)} direcciones por examinar. NINGUNA esta aprobada: pasalas por "
         "'screen-solana-wallets' antes de copiar a nadie",
     )
 

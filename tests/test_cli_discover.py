@@ -114,3 +114,68 @@ def test_no_hace_falta_clave_de_helius(cfg_path, tmp_path):
     sabes si valen es gastar justo donde menos informacion tienes."""
     r = run(cfg_path, pools=UN_POOL, trades={"a": [trade(W1, "500")]})
     assert r.exit_code == 0 and "HELIUS" not in r.output
+
+
+# --- el historial acumulado ---
+
+def test_el_historial_se_crea_en_el_primer_barrido(cfg_path, tmp_path):
+    hist = tmp_path / "barridos.csv"
+    r = run(cfg_path, "--historial", str(hist), pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+    assert r.exit_code == 0, r.output
+    assert W1 in hist.read_text(encoding="utf-8")
+
+
+def test_el_primer_barrido_avisa_de_que_no_dice_nada_aun(cfg_path, tmp_path):
+    """Todos valen 1 barrido: filtrar por eso no separa a nadie de nadie."""
+    r = run(cfg_path, "--historial", str(tmp_path / "h.csv"),
+            pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+    assert "primer barrido" in r.output
+
+
+def test_dos_barridos_acumulan_en_el_mismo_fichero(cfg_path, tmp_path):
+    hist = str(tmp_path / "h.csv")
+    for _ in range(2):
+        r = run(cfg_path, "--historial", hist, pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+        assert r.exit_code == 0, r.output
+    assert "2 barridos" in r.output
+
+
+def test_min_barridos_filtra_a_quien_solo_aparecio_una_vez(cfg_path, tmp_path):
+    hist = str(tmp_path / "h.csv")
+    run(cfg_path, "--historial", hist, pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+    r = run(cfg_path, "--historial", hist, "--min-barridos", "2",
+            pools=UN_POOL, trades={"a": [trade(W1, "500"), trade(W2, "500")]})
+    assert r.exit_code == 0, r.output
+    assert "1 vistas en 2+ barridos" in r.output
+
+
+def test_out_escribe_solo_a_los_persistentes(cfg_path, tmp_path):
+    hist, salida = str(tmp_path / "h.csv"), tmp_path / "candidatas.txt"
+    run(cfg_path, "--historial", hist, pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+    run(cfg_path, "--historial", hist, "--min-barridos", "2", "--out", str(salida),
+        pools=UN_POOL, trades={"a": [trade(W1, "500"), trade(W2, "500")]})
+    assert salida.read_text(encoding="utf-8").strip() == W1
+
+
+def test_min_barridos_sin_historial_se_rechaza(cfg_path):
+    """Con un solo barrido todos valen 1: filtrar por 3 devolveria una lista vacia y
+    parecia que no hay nadie, cuando lo que falta es historial."""
+    r = run(cfg_path, "--min-barridos", "3", pools=UN_POOL)
+    assert r.exit_code == 2 and "--historial" in r.output
+
+
+def test_un_historial_corrupto_PARA_en_vez_de_empezar_de_cero(cfg_path, tmp_path):
+    """Perder barridos acumulados en silencio haria que 'visto en 5 barridos' significara
+    otra cosa sin que nadie se entere."""
+    hist = tmp_path / "h.csv"
+    hist.write_text("wallet,barridos,primera,ultima,mediana_usd,pools\nxx,no,,,,\n",
+                    encoding="utf-8")
+    r = run(cfg_path, "--historial", str(hist), pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+    assert r.exit_code == 2 and "ilegible" in r.output
+
+
+def test_un_historial_con_otra_cabecera_se_rechaza(cfg_path, tmp_path):
+    hist = tmp_path / "h.csv"
+    hist.write_text("otra,cosa\n1,2\n", encoding="utf-8")
+    r = run(cfg_path, "--historial", str(hist), pools=UN_POOL, trades={"a": [trade(W1, "500")]})
+    assert r.exit_code == 2 and "cabecera" in r.output
