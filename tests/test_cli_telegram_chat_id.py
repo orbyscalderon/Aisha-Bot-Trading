@@ -43,8 +43,10 @@ def telegram(updates=(), me_status=200, updates_status=200, error=None):
 def run(cfg_path, client, monkeypatch, token=TOKEN):
     if token is not None:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    # --root apunta al tmp_path, NO al proyecto: si no, el comando carga el .env real de quien
+    # ejecuta la suite y un test de "falta el token" pasa o falla segun la maquina.
     return CliRunner().invoke(
-        app, ["telegram-chat-id", "--config", str(cfg_path)],
+        app, ["telegram-chat-id", "--config", str(cfg_path), "--root", str(cfg_path.parent)],
         obj=CliDeps(telegram_client=client),
     )
 

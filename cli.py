@@ -46,11 +46,20 @@ from adapters.cex.history import (
     write_quotes_csv,
 )
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
+from adapters.env import load_dotenv
 from adapters.solana.prices import (
     JupiterPriceSource,
     LiveSolPrice,
     SolanaPriceError,
     fetch_token_quotes,
+)
+from adapters.solana.discover import (
+    DEFAULT_MAX_POOLS as DISCOVER_MAX_POOLS,
+    DEFAULT_MIN_LIQUIDITY_USD as DISCOVER_MIN_LIQUIDITY_USD,
+    DEFAULT_MIN_POOLS as DISCOVER_MIN_POOLS,
+    DEFAULT_MIN_TRADE_USD as DISCOVER_MIN_TRADE_USD,
+    discover_wallets,
+    format_lead,
 )
 from adapters.solana.screener import format_profile, profile_wallet
 from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
@@ -386,6 +395,16 @@ def _fail(message: str, code: int = 1) -> typer.Exit:
     return typer.Exit(code)
 
 
+def _load_env(root: Path | str) -> None:
+    """Vuelca el ``.env`` de ``root`` en el entorno, sin pisar lo que ya viniera de fuera.
+
+    Va al PRINCIPIO de todo comando que lea claves. Antes solo ``HELIUS_API_KEY`` se leía del
+    fichero, así que la tarea programada —que no tiene a nadie que exporte variables— arrancaba
+    el bot sin Telegram y sin avisar.
+    """
+    load_dotenv(root)
+
+
 def _load(config_path: Path) -> BotConfig:
     try:
         return load_config(config_path)
@@ -506,6 +525,7 @@ def run(
 ) -> None:
     """Ejecuta el bot en modo simulado (paper)."""
     deps = _deps(ctx)
+    _load_env(root)
     cfg = _load(config)
     if cfg.mode is Mode.LIVE:
         # Negarse: ejecutar en simulado creyendo que es real sería la peor confusión posible.
@@ -796,7 +816,9 @@ def mints_for_symbols(symbols: Iterable[str], token_map: Mapping[str, str]) -> d
 
 
 @app.command("telegram-chat-id")
-def telegram_chat_id(ctx: typer.Context, config: Path = ConfigOpt) -> None:
+def telegram_chat_id(
+    ctx: typer.Context, config: Path = ConfigOpt, root: Path = RootOpt
+) -> None:
     """Dice tu chat_id de Telegram, que es lo que va en TELEGRAM_ALLOWED_CHAT_IDS.
 
     Es el paso que atasca a todo el mundo: el token identifica al BOT, pero para que el bot te
@@ -807,6 +829,7 @@ def telegram_chat_id(ctx: typer.Context, config: Path = ConfigOpt) -> None:
 
     Codigos de salida: 0 hay algun chat; 1 ninguno todavia; 2 falta el token o no vale.
     """
+    _load_env(root)
     cfg = _load(config)
     deps = _deps(ctx)
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -881,6 +904,7 @@ def screen_solana_wallets(
     Codigos de salida: 0 alguna wallet pasa la criba; 1 ninguna; 2 argumentos invalidos.
     """
     deps = _deps(ctx)
+    _load_env(root)
     cfg = _load(config)
     now = (deps.now or (lambda: datetime.now(timezone.utc)))()
     start = _parse_aware(since, "--since")
@@ -928,6 +952,102 @@ def screen_solana_wallets(
     _say(cfg, f"{candidatos} de {len(wallets)} pasan la criba")
     if not candidatos:
         raise _fail("ninguna wallet pasa la criba; no hay candidato que copiar")
+
+
+@app.command("discover-solana-wallets")
+def discover_solana_wallets(
+    ctx: typer.Context,
+    config: Path = ConfigOpt,
+    out: Path | None = typer.Option(
+        None, "--out", help="Fichero donde escribir las direcciones, una por linea."
+    ),
+    max_pools: int = typer.Option(
+        DISCOVER_MAX_POOLS, "--max-pools", min=1,
+        help="Pools a recorrer. Cada uno es una peticion y el plan gratuito da ~30 por minuto.",
+    ),
+    min_trade_usd: str = typer.Option(
+        str(DISCOVER_MIN_TRADE_USD), "--min-operacion",
+        help="Importe minimo de un intercambio para tenerlo en cuenta, en USD.",
+    ),
+    min_pools: int = typer.Option(
+        DISCOVER_MIN_POOLS, "--min-pools", min=1,
+        help="Pools distintos en los que hay que haber visto a la wallet.",
+    ),
+    min_liquidity: str = typer.Option(
+        str(DISCOVER_MIN_LIQUIDITY_USD), "--min-liquidez",
+        help="Liquidez minima del pool en USD.",
+    ),
+    limit: int = typer.Option(25, "--limit", min=1, help="Cuantas direcciones mostrar."),
+) -> None:
+    """Busca wallets que esten operando AHORA en los pools con liquidez de Solana.
+
+    Es el paso que faltaba delante de 'screen-solana-wallets': esa sabe decir si una wallet
+    sirve, pero habia que darle las direcciones a mano. Aqui salen de los intercambios reales.
+
+    NO decide nada. Devuelve direcciones PLAUSIBLES, por dos razones concretas: la ventana que
+    publica GeckoTerminal puede ser de minutos (un ritmo calculado sobre eso daria miles de
+    operaciones al dia, que es un artefacto de la division) y solo se ve una cara del pool, no
+    la cartera. Quien juzga es la criba, con el historial completo de Helius.
+
+    Usa GeckoTerminal: gratis y sin clave. No gasta peticiones de Helius.
+
+    El paso siguiente es siempre:
+      python -m cli discover-solana-wallets --out candidatas.txt
+      python -m cli screen-solana-wallets -w <direccion> --since <fecha> --sol-quotes <csv>
+
+    Codigos de salida: 0 hay direcciones; 1 ninguna; 2 argumentos invalidos.
+    """
+    deps = _deps(ctx)
+    cfg = _load(config)
+    try:
+        minimo = Decimal(min_trade_usd)
+        liquidez = Decimal(min_liquidity)
+    except InvalidOperation:
+        raise _fail("--min-operacion y --min-liquidez tienen que ser numeros", 2) from None
+    if minimo <= 0 or liquidez <= 0:
+        raise _fail("--min-operacion y --min-liquidez tienen que ser mayores que cero", 2)
+
+    client = deps.gecko_client if deps.gecko_client is not None else make_gecko_client()
+    sleep = deps.sleep if deps.sleep is not None else time.sleep
+    _say(cfg, f"recorriendo hasta {max_pools} pools con mas de {liquidez} USD de liquidez")
+    try:
+        leads, recuento = discover_wallets(
+            client, max_pools=max_pools, min_trade_usd=minimo, min_pools=min_pools,
+            min_liquidity_usd=liquidez, sleep=sleep,
+        )
+    except SolanaPriceError as exc:
+        raise _fail(f"error: {exc}", 2) from None
+
+    typer.echo(
+        f"{recuento['intercambios']} intercambios de mas de {minimo} USD en "
+        f"{recuento['pools']} pools"
+        + (f" ({recuento['pools_fallidos']} no se pudieron leer)"
+           if recuento["pools_fallidos"] else "")
+    )
+    if not leads:
+        raise _fail(
+            "ninguna direccion aparece en al menos "
+            f"{min_pools} pools con operaciones de {minimo} USD. Baja --min-operacion o "
+            "--min-pools, o sube --max-pools"
+        )
+
+    typer.echo("")
+    for lead in leads[:limit]:
+        typer.echo(format_lead(lead))
+    typer.echo("")
+
+    if out is not None:
+        # Solo las direcciones: el fichero esta hecho para encadenarlo con la criba, no para
+        # leerlo. Lo que se mide aqui no sirve para decidir y guardarlo invitaria a usarlo.
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(l.wallet for l in leads) + "\n", encoding="utf-8")
+        typer.echo(f"{len(leads)} direcciones en {out}")
+
+    _say(
+        cfg,
+        f"{len(leads)} direcciones por examinar. NINGUNA esta aprobada: pasalas por "
+        "'screen-solana-wallets' antes de copiar a nadie",
+    )
 
 
 @app.command("fetch-solana-quotes")
@@ -1039,6 +1159,7 @@ def fetch_solana_signals(
     inválidos; 3 lectura parcial (fichero escrito, pero falló una wallet o quedó recortada).
     """
     deps = _deps(ctx)
+    _load_env(root)
     cfg = _load(config)
     now = (deps.now or (lambda: datetime.now(timezone.utc)))()
     start = _parse_aware(since, "--since")
@@ -1147,6 +1268,7 @@ def _unconfirmed_intents(cfg: BotConfig, root: Path) -> list:
 @app.command()
 def status(config: Path = ConfigOpt, root: Path = RootOpt) -> None:
     """Modo, kill switch y posiciones abiertas."""
+    _load_env(root)
     cfg = _load(config)
     _say(cfg, "estado")
     typer.echo(f"kill switch: {'ACTIVO' if is_kill_switch_active(Path(root)) else 'inactivo'}")
@@ -1169,6 +1291,7 @@ def status(config: Path = ConfigOpt, root: Path = RootOpt) -> None:
 @app.command()
 def positions(config: Path = ConfigOpt, root: Path = RootOpt) -> None:
     """Lista las posiciones abiertas."""
+    _load_env(root)
     cfg = _load(config)
     opened = _open_positions(cfg, root)
     _say(cfg, f"posiciones abiertas: {len(opened)}")

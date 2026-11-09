@@ -42,6 +42,13 @@ MAX_OPS_PER_DAY = Decimal("200")
 #: El bot copia COMPRAS. Una wallet que casi solo vende no ofrece entradas que copiar, por
 #: buena que sea: suele ser un distribuidor o un creador de mercado, no alguien con una tesis.
 MIN_BUY_RATIO = Decimal("0.15")
+#: Un swap "ambiguo" es el que mueve varias monedas a la vez por los dos lados: no se puede
+#: decir qué compró ni qué vendió. Un trader los tiene de vez en cuando (un agregador parte una
+#: orden en varias rutas). Una wallet donde son la INMENSA mayoría no está tomando posiciones:
+#: está enrutando o arbitrando, y de eso no sale ninguna entrada que copiar.
+#: El caso real: una wallet con 16 operaciones limpias y 923 ambiguas en dos días pasaba la
+#: criba como candidato, porque solo se miraban las 16.
+MAX_AMBIGUOUS_RATIO = Decimal("0.70")
 
 
 def _median(values: Sequence[Decimal]) -> Decimal:
@@ -88,6 +95,17 @@ class WalletProfile:
         return Decimal(self.omitidos.get("below_dust", 0)) / Decimal(self.swaps_leidos)
 
     @property
+    def ambiguo_ratio(self) -> Decimal:
+        """Fracción de swaps que mueven varias monedas por ambos lados.
+
+        Alto significa enrutado o arbitraje, no una tesis direccional. Mirar solo las
+        operaciones limpias de una wallet así es juzgarla por el 2 % que se entiende.
+        """
+        if self.swaps_leidos <= 0:
+            return Decimal(0)
+        return Decimal(self.omitidos.get("ambiguous", 0)) / Decimal(self.swaps_leidos)
+
+    @property
     def buy_ratio(self) -> Decimal:
         """Fracción de operaciones que son compras: lo único que este bot sabe copiar."""
         if self.señales <= 0:
@@ -131,6 +149,12 @@ class WalletProfile:
             motivos.append(
                 f"{self.fee_payer_ratio:.0%} de los swaps son ajenos y solo paga la comisión: "
                 "es infraestructura, no un trader"
+            )
+        if self.ambiguo_ratio > MAX_AMBIGUOUS_RATIO:
+            motivos.append(
+                f"{self.ambiguo_ratio:.0%} de sus swaps mueven varias monedas a la vez por los "
+                "dos lados: está enrutando o arbitrando, no tomando posiciones. Las pocas "
+                "operaciones limpias que se le entienden no la representan"
             )
         if self.mediana_usd < MIN_MEDIAN_USD:
             motivos.append(
@@ -201,7 +225,8 @@ def format_profile(p: WalletProfile) -> str:
         "  actividad         "
         + (f"{p.por_dia:.1f} op/día sobre {p.dias:.1f} días" if p.por_dia is not None
            else f"ventana de solo {p.dias:.2f} días: demasiado corta para medir el ritmo"),
-        f"  comisiones ajenas {p.fee_payer_ratio:.0%}   polvo {p.polvo_ratio:.0%}",
+        f"  comisiones ajenas {p.fee_payer_ratio:.0%}   polvo {p.polvo_ratio:.0%}   "
+        f"multi-pata {p.ambiguo_ratio:.0%}",
     ]
     if sirve:
         lineas.append("  --> CANDIDATO: pasa la criba. El backtest dirá si copiarlo gana dinero.")

@@ -201,3 +201,31 @@ def test_un_ritmo_humano_no_se_descarta():
                    horas=i * 8) for i in range(12)]       # 12 ops en 88 horas
     sirve, motivos = profile_wallet(W, señales, 12).verdict()
     assert sirve, motivos
+
+
+# --- enrutadores y arbitrajistas disfrazados de trader ---
+
+def test_se_descarta_a_quien_casi_solo_hace_swaps_multi_pata():
+    """Caso real: 16 operaciones limpias y 923 ambiguas en dos dias. La criba la certificaba
+    como candidato porque solo miraba las 16. Las 923 decian lo que era: un enrutador."""
+    p = profile_wallet(W, muchas(), swaps_leidos=1000, omitidos={"ambiguous": 950})
+    sirve, motivos = p.verdict()
+    assert not sirve
+    assert any("enrutando o arbitrando" in m for m in motivos)
+
+
+def test_un_trader_que_usa_agregadores_de_vez_en_cuando_NO_se_descarta():
+    """Un agregador parte una orden en varias rutas, asi que algun swap ambiguo es normal.
+    El umbral descarta a quien SOLO hace eso, no a quien lo hace a veces."""
+    p = profile_wallet(W, muchas(), swaps_leidos=100, omitidos={"ambiguous": 40})
+    sirve, motivos = p.verdict()
+    assert sirve, motivos
+
+
+def test_el_ratio_multi_pata_sale_en_el_retrato():
+    texto = format_profile(profile_wallet(W, muchas(), 100, {"ambiguous": 50}))
+    assert "multi-pata" in texto and "50%" in texto
+
+
+def test_sin_swaps_leidos_el_ratio_es_cero_y_no_divide_entre_cero():
+    assert profile_wallet(W, [], 0).ambiguo_ratio == Decimal(0)

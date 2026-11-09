@@ -23,10 +23,20 @@ Hace:
   abiertas), stop-loss, protecciones (cooldown, racha de stops, drawdown, exposición por
   grupo) y un kill switch.
 
+- **Copia wallets de Solana EN VIVO** (`run --solana-wallet`): lee los swaps de la wallet en
+  cada ciclo vía Helius y los convierte en señales, sin pasar por ningún CSV.
+- **Busca y criba traders**: `discover-solana-wallets` saca direcciones que están operando
+  ahora; `screen-solana-wallets` mide cuáles son traders de verdad y cuáles son
+  infraestructura.
+- **Se maneja por Telegram**: `/estado`, `/posiciones`, `/pausa`, `/stop`, en español o en
+  inglés. Con una clave de Claude entiende además frases libres.
+- **Arranca solo con el equipo** (`scripts/instalar-servicio.ps1`, Windows).
+
 No hace:
 - Ejecución real (plan 3). Ni conecta claves de trading ni envía órdenes.
-- Obtener señales por sí mismo: las señales se le dan en un CSV.
 - Garantizar nada: un backtest rentable no predice resultados futuros.
+- Decirte a quién copiar. La criba **descarta** con seguridad; que una wallet la pase solo
+  significa que merece un backtest, no que ganes dinero copiándola.
 
 ## Instalación
 
@@ -44,7 +54,8 @@ Los ejemplos de abajo usan `copybot`.
 
 ## Configuración
 
-Copia `config/config.example.yaml` a `config/config.yaml` y ajústalo. Las secciones:
+Copia `config/config.example.yaml` a `config/paper.yaml` y ajústalo (en el repositorio hay un
+`config/paper.yaml` ya hecho, con límites conservadores). Las secciones:
 
 | Sección | Qué controla |
 |---|---|
@@ -67,18 +78,25 @@ y en backtest eso solo genera un aviso al arrancar; en `live` la sección es obl
 ## Comandos
 
 ```bash
-copybot backtest --config config/config.yaml --signals senales.csv --quotes cotizaciones.csv --report informe.html
-copybot run      --config config/config.yaml --signals senales.csv [--once]
-copybot status   --config config/config.yaml
-copybot positions --config config/config.yaml
+copybot backtest --config config/paper.yaml --signals senales.csv --quotes cotizaciones.csv --report informe.html
+copybot run      --config config/paper.yaml --solana-wallet <dirección> [--once]
+copybot run      --config config/paper.yaml --signals senales.csv [--once]
+copybot status   --config config/paper.yaml
+copybot positions --config config/paper.yaml
 copybot stop
 ```
+
+Para Solana y Telegram hay comandos propios, explicados más abajo:
+`discover-solana-wallets`, `screen-solana-wallets`, `fetch-solana-signals`,
+`fetch-solana-quotes` y `telegram-chat-id`.
 
 - `backtest`: reproduce el pasado. Imprime métricas, cierres por motivo y las
   **posiciones que siguen abiertas al final con su PnL latente** (las métricas solo
   cuentan lo cerrado; fíjate también en esa línea). `--report` escribe el informe HTML de
   quantstats. `--step-minutes` (60 por defecto) fija el paso del reloj simulado.
-- `run`: ejecución simulada continua. Lanza un ciclo de entrada según `cadence.entry_cron`
+- `run`: ejecución simulada continua. Necesita **una** fuente de señales: `--solana-wallet`
+  (en vivo, repetible) o `--signals` (un CSV estático), nunca las dos a la vez. Lanza un
+  ciclo de entrada según `cadence.entry_cron`
   y otro de salida cada `exit_interval_seconds`; nunca se solapan, y si el equipo se
   suspende se ejecuta un solo ciclo atrasado al despertar. `--once` ejecuta un ciclo de
   cada y termina. `--exchange` elige el exchange de las cotizaciones (por defecto
@@ -114,11 +132,92 @@ convertirlas a ese formato. Cuanto más fino el intervalo, más fiel el stop-los
 Las fechas sin zona horaria se interpretan como UTC. El backtest simula un solo mercado
 por ejecución.
 
-### Notificaciones
+## Claves: el fichero `.env`
 
-Por defecto los avisos salen por consola. Para recibirlos por Telegram define las
-variables de entorno `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`. Todo mensaje empieza por
-`mode: paper` (o `mode: live`), para que nunca haya duda de en qué modo estás.
+Las claves van en un fichero `.env` en la carpeta del bot (la de `--root`), **nunca en el
+YAML** ni en el repositorio. Está en `.gitignore`.
+
+```
+HELIUS_API_KEY=...                # leer wallets de Solana
+TELEGRAM_BOT_TOKEN=...            # avisos y control por chat
+TELEGRAM_ALLOWED_CHAT_IDS=123456  # QUIÉN puede dar órdenes al bot
+LLM_API_KEY=...                   # opcional: entender frases libres
+```
+
+Dos reglas del cargador, por si sorprenden:
+
+- **Lo que ya esté en el entorno gana al fichero.** Un `.env` olvidado en el disco no puede
+  silenciar lo que un servicio configuró de forma explícita.
+- **Un `#` solo es comentario al principio de la línea.** Recortar en silencio el final de
+  un secreto da un "token inválido" imposible de diagnosticar.
+
+## Control por Telegram
+
+Define `TELEGRAM_BOT_TOKEN` y `TELEGRAM_ALLOWED_CHAT_IDS` y el bot escucha. Entiende
+`/estado`, `/posiciones`, `/pnl`, `/pausa`, `/reanudar`, `/stop` y `/ayuda`, en español y en
+inglés. Con `LLM_API_KEY` entiende además frases sueltas, pero **el modelo solo traduce a un
+comando de esa lista cerrada: nunca ejecuta lo que lea**. Es la defensa contra que alguien le
+escriba instrucciones al bot.
+
+La autorización **falla cerrada**: sin `TELEGRAM_ALLOWED_CHAT_IDS` no hay nadie autorizado, y
+a un chat no autorizado no se le responde nada (responder ya confirmaría que el bot existe).
+
+El `chat_id` no es el nombre del bot: es el número de **tu** conversación con él, y Telegram
+solo lo revela después de que le escribas. Para sacarlo:
+
+```bash
+copybot telegram-chat-id        # manda antes cualquier mensaje al bot
+```
+
+Todo mensaje empieza por `mode: paper` (o `mode: live`), para que nunca haya duda de en qué
+modo estás. Sin token, los avisos salen por consola y el bot opera igual: quedarse sin operar
+por no poder avisar sería dejar de hacer lo importante por no poder hacer lo accesorio.
+
+## Copiar wallets de Solana
+
+El orden importa, y los dos primeros pasos existen porque saltárselos sale caro: la primera
+wallet que se probó parecía un trader y era infraestructura que pagaba comisiones ajenas.
+
+```bash
+# 1. ¿quién está operando ahora? (GeckoTerminal, gratis, sin clave)
+copybot discover-solana-wallets --out candidatas.txt
+
+# 2. ¿cuáles son traders de verdad? (Helius; descarta bots e infraestructura)
+copybot fetch-quotes -s SOL/USDT --since 2026-11-01T00:00:00+00:00 --out sol.csv
+copybot screen-solana-wallets -w <dirección> --since 2026-11-01T00:00:00+00:00 --sol-quotes sol.csv
+
+# 3. ¿habría ganado dinero copiarla? (eso solo lo dice el backtest)
+copybot fetch-solana-signals -w <dirección> --since ... --out senales.csv --sol-quotes sol.csv
+copybot fetch-solana-quotes --signals senales.csv --since ... --out precios.csv
+copybot backtest --signals senales.csv --quotes precios.csv
+
+# 4. copiarla en vivo
+copybot run --solana-wallet <dirección>
+```
+
+**Lo que la criba mide** (todo sale de swaps reales, nada se estima): tamaño mediano de las
+operaciones, cuántos tokens distintos toca, compras frente a ventas, ritmo de operaciones,
+qué fracción de sus swaps son comisiones de otros, y qué fracción mueve varias monedas a la
+vez por ambos lados — esto último delata a los enrutadores y arbitrajistas, que parecen
+traders si solo miras las pocas operaciones que se les entienden.
+
+**Lo que la criba NO mide**: si copiarla gana dinero. Eso depende de tus umbrales (un trader
+excelente con posiciones de seis meses es inútil con un time-stop de 72 h) y lo contesta el
+backtest.
+
+## Arranque automático (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\instalar-servicio.ps1 -SolanaWallet <dirección>
+```
+
+Registra una tarea programada que arranca el bot al iniciar sesión, lo reinicia si se cae y
+escribe todo en `logs\bot.log`. Comprueba **antes de registrar nada** que existen el entorno
+virtual, la configuración y la clave de Helius, y se niega si el YAML dice `mode: live`. Avisa
+—sin impedir la instalación— si el bot va a arrancar mudo por faltarle Telegram.
+
+Parada de emergencia: crea un fichero vacío llamado `STOP` en la carpeta del bot, o mándale
+`/stop` por Telegram. Desinstalar: `scripts\desinstalar-servicio.ps1`.
 
 ## Probar un backtest rápido
 

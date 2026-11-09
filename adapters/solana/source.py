@@ -81,6 +81,7 @@ from typing import Any, Callable, Iterable
 import httpx
 import yaml
 
+from adapters.env import DOTENV_FILENAME, read_dotenv
 from core.models import Market, Side, Signal
 from ports.signal_source import SignalSource, signature_signal_id
 
@@ -199,24 +200,12 @@ def load_api_key(env: Mapping[str, str], root: Path) -> str:
     value = (env.get(ENV_VAR) or "").strip()
     if value:
         return value
-    dotenv = Path(root) / ".env"
-    try:
-        text = dotenv.read_text(encoding="utf-8-sig")
-    except OSError:
-        text = ""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        name, sep, raw = line.partition("=")
-        if sep and name.strip() == ENV_VAR:
-            raw = raw.strip()
-            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
-                raw = raw[1:-1]
-            if raw.strip():
-                return raw.strip()
+    dotenv = Path(root) / DOTENV_FILENAME
+    # El parseo vive en adapters.env: tener dos lectores del mismo fichero es tener dos
+    # comportamientos distintos ante un BOM o un CRLF, y descubrirlo en producción.
+    desde_fichero = (read_dotenv(root).get(ENV_VAR) or "").strip()
+    if desde_fichero:
+        return desde_fichero
     raise HeliusError(
         f"falta {ENV_VAR}: defínela en el entorno o en {dotenv} (plantilla en config/.env.example)"
     )
