@@ -795,6 +795,69 @@ def mints_for_symbols(symbols: Iterable[str], token_map: Mapping[str, str]) -> d
     return por_simbolo
 
 
+@app.command("telegram-chat-id")
+def telegram_chat_id(ctx: typer.Context, config: Path = ConfigOpt) -> None:
+    """Dice tu chat_id de Telegram, que es lo que va en TELEGRAM_ALLOWED_CHAT_IDS.
+
+    Es el paso que atasca a todo el mundo: el token identifica al BOT, pero para que el bot te
+    hable hace falta el numero de TU conversacion con el, y Telegram solo lo revela despues de
+    que le escribas. Manda cualquier mensaje al bot y ejecuta esto.
+
+    No cambia nada: solo lee y muestra.
+
+    Codigos de salida: 0 hay algun chat; 1 ninguno todavia; 2 falta el token o no vale.
+    """
+    cfg = _load(config)
+    deps = _deps(ctx)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise _fail("falta TELEGRAM_BOT_TOKEN en el entorno o en .env", 2)
+
+    import httpx
+    from adapters.notify.telegram import _API, _scrub
+    client = deps.telegram_client if deps.telegram_client is not None else httpx.Client(timeout=20.0)
+    try:
+        yo = client.get(f"{_API}/bot{token}/getMe")
+        if yo.status_code == 401:
+            raise _fail("Telegram rechazo el token (HTTP 401): revisa TELEGRAM_BOT_TOKEN", 2)
+        if yo.status_code != 200:
+            raise _fail(f"Telegram respondio HTTP {yo.status_code} a getMe", 2)
+        nombre = ((yo.json() or {}).get("result") or {}).get("username") or "?"
+        _say(cfg, f"bot @{nombre}: el token es valido")
+        r = client.get(f"{_API}/bot{token}/getUpdates", params={"limit": 50})
+        if r.status_code != 200:
+            raise _fail(f"Telegram respondio HTTP {r.status_code} al pedir mensajes", 2)
+        updates = ((r.json() or {}).get("result")) or []
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _fail(f"fallo hablando con Telegram: {type(exc).__name__}: "
+                    f"{_scrub(str(exc), token)[:120]}", 2) from None
+
+    chats: dict[Any, tuple[str, str]] = {}
+    for u in updates:
+        mensaje = (u or {}).get("message") or (u or {}).get("edited_message") or {}
+        chat = mensaje.get("chat") or {}
+        if chat.get("id") is not None:
+            chats[chat["id"]] = (
+                str(chat.get("type") or "?"),
+                str(chat.get("username") or chat.get("first_name") or chat.get("title") or "?"),
+            )
+    if not chats:
+        raise _fail(
+            f"nadie ha escrito a @{nombre} todavia. Abrelo en Telegram, pulsa Start o mandale "
+            "cualquier mensaje, y vuelve a ejecutar esto"
+        )
+
+    typer.echo("")
+    for cid, (tipo, quien) in chats.items():
+        typer.echo(f"  chat_id {cid}   ({tipo}, de {quien})")
+    typer.echo("")
+    typer.echo("Pon esto en tu .env:")
+    typer.echo(f"  TELEGRAM_ALLOWED_CHAT_IDS={','.join(str(c) for c in chats)}")
+    typer.echo(f"  TELEGRAM_CHAT_ID={next(iter(chats))}")
+
+
 @app.command("screen-solana-wallets")
 def screen_solana_wallets(
     ctx: typer.Context,
