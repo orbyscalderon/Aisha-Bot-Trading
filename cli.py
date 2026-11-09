@@ -46,6 +46,11 @@ from adapters.cex.history import (
 )
 from adapters.cex.source import CexCsvSignalSource, CexDataSource
 from adapters.solana.sol_price import SOL_SYMBOLS, SolPriceError, SolPriceTable
+from interfaces.chat.telegram_listener import TelegramListener
+from interfaces.dispatcher import Dispatcher
+from interfaces.nlu.claude import ClaudeParser
+from interfaces.nlu.rules import RulesParser
+from interfaces.reports import BotReports
 from adapters.solana.source import (
     OMISSION_REASONS,
     HeliusError,
@@ -107,6 +112,7 @@ class CliDeps:
     sleep: Callable[[float], None] | None = None  # temporizador de fetch-quotes
     now: Callable[[], datetime] | None = None  # reloj de fetch-quotes y fetch-solana-signals
     solana_client: Any = None  # cliente httpx de fetch-solana-signals
+    telegram_client: Any = None  # cliente httpx del control por Telegram
 
 
 # --- composición ---
@@ -137,6 +143,59 @@ def _make_notifier(mode: Mode) -> Notifier:
     if token and chat_id:
         return TelegramNotifier(token, chat_id, mode)
     return ConsoleNotifier(mode)
+
+
+def parse_chat_allowlist(raw: str | None) -> frozenset[str]:
+    """Lista de chat_id autorizados, separados por comas o puntos y coma.
+
+    Falla cerrado: una cadena vacia da un conjunto vacio, y un conjunto vacio no autoriza a
+    nadie. Si significara "todos", un .env a medio rellenar abriria el bot a cualquiera.
+    """
+    texto = (raw or "").replace(";", ",")
+    return frozenset(p.strip() for p in texto.split(",") if p.strip())
+
+
+def build_chat_listener(
+    config: BotConfig,
+    root: Path,
+    *,
+    quote_fn: Any = None,
+    client: Any = None,
+    llm_client: Any = None,
+) -> tuple[TelegramListener | None, str]:
+    """Monta el control por Telegram, o explica por que no se puede. Nunca lanza.
+
+    Devuelve ``(escucha, motivo)``. Si ``escucha`` es None, ``motivo`` dice que falta. El bot
+    tiene que poder arrancar sin chat: quedarse sin operar porque falta un token de Telegram
+    seria dejar de hacer lo importante por no poder hacer lo accesorio.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    autorizados = parse_chat_allowlist(
+        os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS") or os.environ.get("TELEGRAM_CHAT_ID")
+    )
+    if not token:
+        return None, "falta TELEGRAM_BOT_TOKEN"
+    if not autorizados:
+        return None, "falta TELEGRAM_ALLOWED_CHAT_IDS (o TELEGRAM_CHAT_ID): nadie autorizado"
+
+    # Conexion PROPIA del hilo de chat, por la misma razon que la auditoria del cerrojo: el
+    # motor puede estar a mitad de una transaccion en el hilo del planificador.
+    conn = init_db(_db_path(config, root), check_same_thread=False)
+    reports = BotReports(config.mode, Path(root), lambda: Repository(conn), quote_fn=quote_fn)
+
+    # Las reglas SIEMPRE primero: un comando exacto no debe depender de una llamada de red ni
+    # costar dinero. Claude solo entra con lo que las reglas no entienden, y si falla se
+    # degrada a UNKNOWN (el usuario recibe la ayuda, el bot sigue operando).
+    parsers: list[Any] = [RulesParser()]
+    llm_key = os.environ.get("LLM_API_KEY")
+    if llm_key:
+        parsers.append(ClaudeParser(llm_key, client=llm_client))
+
+    dispatcher = Dispatcher(
+        root=Path(root), authorized=autorizados, parsers=parsers,
+        reports=reports, audit=AuditLog(conn),
+    )
+    return TelegramListener(token, dispatcher, client=client), ""
 
 
 def _build(
@@ -477,11 +536,27 @@ def run(
         exit_job, IntervalTrigger(seconds=cfg.cadence.exit_interval_seconds, timezone=timezone.utc),
         id="exit", name="ciclo de salida", **common,
     )
+    # Control por Telegram en un hilo aparte. Es accesorio: si no esta configurado, el bot
+    # opera igual y lo dice. Lo que no puede pasar es que la falta de chat impida operar.
+    listener, motivo = build_chat_listener(
+        cfg, root, quote_fn=deps.data_source.get_quote if deps.data_source is not None else None,
+        client=deps.telegram_client,
+    )
+    chat_thread = None
+    if listener is None:
+        _say(cfg, f"control por Telegram desactivado: {motivo}")
+    else:
+        chat_thread = threading.Thread(target=listener.run_forever, name="telegram", daemon=True)
+        chat_thread.start()
+        _say(cfg, "control por Telegram activo: escribe /help al bot")
+
     _say(cfg, f"entrada: cron '{cfg.cadence.entry_cron}' (UTC); salida cada {cfg.cadence.exit_interval_seconds} s. Ctrl+C para parar")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown(wait=False)
+        if listener is not None:
+            listener.stop()
         _say(cfg, "detenido")
 
 
