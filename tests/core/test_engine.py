@@ -263,6 +263,29 @@ def test_kill_switch_does_not_block_exits(make_env):
     assert len(env.engine.run_exit_cycle(NOW).closed) == 1
 
 
+def test_pause_blocks_entries(make_env):
+    env = make_env()
+    (env.root / "PAUSE").touch()
+    r = env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert r.opened == [] and r.cursor_advanced is False
+
+
+def test_pause_does_not_block_exits(make_env):
+    """Pausar y dejar de vigilar los stop-loss de lo ya abierto seria peor que no pausar."""
+    env = make_env()
+    open_pos(env, entry=100)
+    env.data.price = Decimal("80")
+    (env.root / "PAUSE").touch()
+    assert len(env.engine.run_exit_cycle(NOW).closed) == 1
+
+
+def test_pause_is_audited_so_it_is_visible_afterwards(make_env):
+    env = make_env()
+    (env.root / "PAUSE").touch()
+    env.engine.run_entry_cycle(FakeSource([sig("s1")]), NOW)
+    assert any(e.event == "paused" for e in env.audit.events())
+
+
 def test_not_allowlisted_trader_is_rejected(make_env):
     env = make_env()
     r = env.engine.run_entry_cycle(FakeSource([sig("s1", trader="intruso")]), NOW)

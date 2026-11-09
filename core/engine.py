@@ -50,7 +50,7 @@ from core.rules.exits import evaluate_exit, next_peak_price
 from core.rules.protections import ProtectionState, evaluate_protections
 from core.rules.risk import RiskAction, build_risk_state, evaluate_risk
 from core.rules.sizing import SizingContext, apply_hard_cap, calculate_size
-from core.safety import CircuitBreaker, is_kill_switch_active
+from core.safety import CircuitBreaker, is_kill_switch_active, is_paused
 from core.signals import clamp_cursor, ensure_frozen_allowlist, filter_by_allowlist
 from ports.market import MarketDataSource, OrderExecutor, OrderRejected, QuoteUnavailable
 from ports.notifier import Level, Notifier
@@ -147,6 +147,12 @@ class Engine:
         if is_kill_switch_active(self._root):
             self._log("kill_switch_active", now, source=source.name)
             self._notify("kill switch activo: entradas bloqueadas", Level.WARNING)
+            return result
+        if is_paused(self._root):
+            # Solo las aperturas. run_exit_cycle no mira la pausa a proposito: dejar de vigilar
+            # los stop-loss de lo ya abierto seria peor que no pausar nada.
+            self._log("paused", now, source=source.name)
+            self._notify("en pausa: entradas detenidas (las salidas siguen)", Level.INFO)
             return result
         if self._breaker.is_open:
             self._log("circuit_breaker_open", now, source=source.name)
