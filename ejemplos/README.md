@@ -10,7 +10,7 @@ credenciales y para dejar constancia de qué se ha probado.
 |---|---|
 | `cotizaciones.csv` | Cuatro precios a mano, para el ejemplo mínimo del README |
 | `cotizaciones_reales.csv` | Velas de 1 h de Binance (`fetch-quotes`) |
-| `q3.csv` | Velas de 1 h de un trimestre completo |
+| `q3.csv` | Velas de 1 h de un trimestre. **No está en el repo** por tamaño; se regenera con `fetch-quotes` |
 | `sol_usdt.csv` | 955 velas de 1 h de SOL/USDT, 2026-09-30 → 2026-11-08. SOL pasó de 118,95 a 89,56 USD |
 
 ## Señales
@@ -27,7 +27,7 @@ credenciales y para dejar constancia de qué se ha probado.
 | Fichero | Qué es |
 |---|---|
 | `config_takeprofit.yaml`, `config_largo.yaml` | Dos calibraciones del mismo backtest, para comparar |
-| `informe.html` | Informe de quantstats de un backtest |
+| `informe.html` | Informe de quantstats. **No está en el repo**: lo genera `backtest --report` |
 
 ## Lo que enseñan estos ficheros
 

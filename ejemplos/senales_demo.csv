@@ -1,0 +1,9 @@
+timestamp,trader_id,symbol,side,amount_usd
+2026-10-02T12:00:00+00:00,trader_demo,BTC/USDT,buy,100
+2026-10-05T12:00:00+00:00,trader_demo,ETH/USDT,buy,100
+2026-10-09T12:00:00+00:00,trader_demo,BTC/USDT,buy,100
+2026-10-14T12:00:00+00:00,trader_demo,ETH/USDT,buy,100
+2026-10-18T12:00:00+00:00,trader_demo,BTC/USDT,buy,100
+2026-10-22T12:00:00+00:00,trader_demo,ETH/USDT,buy,100
+2026-10-26T12:00:00+00:00,trader_demo,BTC/USDT,buy,100
+2026-10-29T12:00:00+00:00,trader_demo,ETH/USDT,buy,100

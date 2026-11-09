@@ -12,5 +12,10 @@ STOP
 logs/
 .pytest_cache/
 .superpowers/
-ejemplos/*.csv
+# Los CSV de ejemplo SI van al repo (son la prueba de las ejecuciones reales y hacen el
+# backtest reproducible sin credenciales). Se excluyen solo los pesados y regenerables.
+ejemplos/q3.csv
 ejemplos/*.html
+logs/
+*.db-shm
+*.db-wal
