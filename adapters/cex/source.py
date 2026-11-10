@@ -50,6 +50,34 @@ def _to_decimal(value: Any, what: str) -> Decimal:
     return result
 
 
+def make_exchange_client(
+    exchange_id: str,
+    api_key: str | None = None,
+    secret: str | None = None,
+    *,
+    testnet: bool = False,
+) -> Any:
+    """Construye el cliente de ccxt. Único sitio que decide testnet o real.
+
+    Se extrae aquí para que la fuente de precios y el ejecutor compartan UN cliente:
+    dos clientes serían dos limitadores de tasa que no se ven, y cada uno con su
+    propia copia de los mercados. Además, cuando ambos salen de la misma llamada, no
+    puede pasar que uno acabe en testnet y el otro en el exchange real.
+    """
+    exchange_cls = getattr(ccxt, exchange_id, None)
+    if exchange_id not in ccxt.exchanges or exchange_cls is None:
+        raise ValueError(f"exchange desconocido: {exchange_id}")
+    config: dict[str, Any] = {"enableRateLimit": True}
+    if api_key:
+        config["apiKey"] = api_key
+    if secret:
+        config["secret"] = secret
+    client = exchange_cls(config)
+    if testnet:
+        client.set_sandbox_mode(True)
+    return client
+
+
 class CexDataSource(MarketDataSource):
     def __init__(
         self,
@@ -62,17 +90,7 @@ class CexDataSource(MarketDataSource):
         max_attempts: int = MAX_ATTEMPTS,
         ignore_assets: Iterable[str] = (),
     ) -> None:
-        exchange_cls = getattr(ccxt, exchange_id, None)
-        if exchange_id not in ccxt.exchanges or exchange_cls is None:
-            raise ValueError(f"exchange desconocido: {exchange_id}")
-        config: dict[str, Any] = {"enableRateLimit": True}
-        if api_key:
-            config["apiKey"] = api_key
-        if secret:
-            config["secret"] = secret
-        client = exchange_cls(config)
-        if testnet:
-            client.set_sandbox_mode(True)
+        client = make_exchange_client(exchange_id, api_key, secret, testnet=testnet)
         self._init(client, sleep, max_attempts, ignore_assets)
 
     def _init(

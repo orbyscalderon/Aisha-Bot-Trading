@@ -19,8 +19,8 @@ from adapters.notify.console import ConsoleNotifier
 from adapters.notify.telegram import TelegramNotifier
 from cli import CliDeps, app, build_engine
 from core.config import load_config
-from core.models import Quote
-from ports.market import MarketDataSource
+from core.models import Fill, Quote, Side
+from ports.market import MarketDataSource, OrderExecutor
 from ports.notifier import Level, Notifier
 
 UTC = timezone.utc
@@ -61,7 +61,14 @@ def paper_yaml(tmp_path):
 
 @pytest.fixture
 def live_yaml(tmp_path):
+    """mode: live con testnet (el valor por defecto): dinero de mentira, API de verdad."""
     return write_yaml(tmp_path / "live.yaml", mode="live")
+
+
+@pytest.fixture
+def real_money_yaml(tmp_path):
+    """mode: live con testnet: false. Esto es dinero de verdad."""
+    return write_yaml(tmp_path / "real.yaml", mode="live", cex={"testnet": False})
 
 
 @pytest.fixture
@@ -91,6 +98,23 @@ class FakeData(MarketDataSource):
 
     def get_balance(self):
         return Decimal(10000)
+
+
+class FakeExecutor(OrderExecutor):
+    """Ejecutor de mentira para los tests de modo live: no toca ninguna red."""
+
+    def submit_buy(self, order):
+        return self._fill(order, Side.BUY, order.amount_usd / Decimal(100))
+
+    def submit_sell(self, order):
+        return self._fill(order, Side.SELL, order.quantity)
+
+    def _fill(self, order, side, quantity):
+        return Fill(
+            id="f1", client_order_id=order.client_order_id, market=order.market,
+            symbol=order.symbol, side=side, price=Decimal(100), quantity=quantity,
+            fee_usd=Decimal(0), timestamp=datetime.now(UTC), position_id=order.position_id,
+        )
 
 
 class RecordingNotifier(Notifier):
@@ -123,26 +147,78 @@ def invoke(args, deps=None):
 
 # --- run: modo ---
 
-def test_run_refuses_live_mode_in_this_plan(live_yaml, signals_csv, root):
-    r = invoke(["run", "--config", str(live_yaml), "--signals", str(signals_csv),
+def test_run_refuses_real_money_without_the_explicit_flag(real_money_yaml, signals_csv, root):
+    """Gastar dinero real exige DOS actos independientes: `testnet: false` en el YAML,
+    que se versiona y queda en el historial, y la bandera al arrancar. Con un solo
+    interruptor, un fichero copiado de otro sitio bastaria para empezar a gastar."""
+    r = invoke(["run", "--config", str(real_money_yaml), "--signals", str(signals_csv),
                 "--root", str(root), "--once"])
     assert r.exit_code != 0
-    assert "no implementado" in r.output
-    assert "plan 3" in r.output
+    assert "DINERO REAL" in r.output and "--dinero-real" in r.output
     # no se ejecutó nada, ni siquiera en simulado
     assert not list(root.glob("*.db"))
 
 
-def test_run_live_never_starts_scheduler(live_yaml, signals_csv, root):
+def test_real_money_never_starts_the_scheduler(real_money_yaml, signals_csv, root):
     sched = FakeScheduler()
-    invoke(["run", "--config", str(live_yaml), "--signals", str(signals_csv),
+    invoke(["run", "--config", str(real_money_yaml), "--signals", str(signals_csv),
             "--root", str(root)], CliDeps(scheduler=sched, data_source=FakeData()))
     assert sched.jobs == [] and not sched.started
 
 
-def test_build_engine_refuses_live(live_yaml, root):
-    with pytest.raises(cli.LiveModeNotImplemented):
+def test_testnet_does_not_need_the_real_money_flag(live_yaml, signals_csv, root):
+    """Con testnet el dinero es de mentira. Pedir ahí la misma confirmación acostumbraría
+    a teclearla siempre, y entonces no protegería nada el día que importa."""
+    r = invoke(["run", "--config", str(live_yaml), "--signals", str(signals_csv),
+                "--root", str(root), "--once"],
+               CliDeps(data_source=FakeData(), executor=FakeExecutor()))
+    assert "DINERO REAL" not in r.output
+    assert "EN VIVO" in r.output and "testnet" in r.output
+
+
+def test_live_announces_real_money_when_that_is_what_it_is(real_money_yaml, signals_csv, root):
+    """Confundir testnet con dinero real, en cualquiera de los dos sentidos, es la peor
+    equivocación posible con este programa. Por eso se dice siempre y sin rodeos."""
+    r = invoke(["run", "--config", str(real_money_yaml), "--signals", str(signals_csv),
+                "--root", str(root), "--once", "--dinero-real"],
+               CliDeps(data_source=FakeData(), executor=FakeExecutor()))
+    assert "DINERO REAL" in r.output
+
+
+def test_build_live_without_credentials_says_which_one_is_missing(live_yaml, root):
+    """Un bot que arranca sin poder operar es peor que uno que no arranca: parece vivo."""
+    with pytest.raises(cli.MissingExchangeCredentials) as exc:
         build_engine(load_config(live_yaml), root)
+    assert "EXCHANGE_API_KEY" in str(exc.value)
+
+
+def test_the_error_about_credentials_never_prints_a_key(live_yaml, root, monkeypatch):
+    """Un mensaje que incluyera la clave la dejaría escrita en los logs del proveedor."""
+    monkeypatch.setenv("EXCHANGE_API_KEY", "clave-secretisima")
+    with pytest.raises(cli.MissingExchangeCredentials) as exc:
+        build_engine(load_config(live_yaml), root)
+    assert "clave-secretisima" not in str(exc.value)
+    assert "EXCHANGE_API_SECRET" in str(exc.value)
+
+
+def test_live_does_not_fake_the_capital(live_yaml, root):
+    """En simulado el capital es un número de configuración; en vivo es el saldo de la
+    cuenta. Envolverlo en PaperCapitalSource haría dimensionar contra dinero que no existe."""
+    fuente = FakeData()
+    engine = build_engine(
+        load_config(live_yaml), root,
+        data_source=fuente, executor=FakeExecutor(), paper_capital=Decimal(1),
+    )
+    assert engine._data is fuente, "en vivo la fuente llega sin envolver"
+    # El capital simulado era 1 USD; el saldo que se usa es el de la cuenta.
+    assert engine._data.get_balance() == Decimal(10000)
+
+
+def test_live_with_an_injected_source_but_no_executor_refuses(live_yaml, root):
+    """Sin cliente del exchange no hay con qué mandar órdenes. Un CexExecutor envolviendo
+    None se construiría sin quejarse y fallaría en la primera orden de verdad."""
+    with pytest.raises(cli.LiveModeNotImplemented):
+        build_engine(load_config(live_yaml), root, data_source=FakeData())
 
 
 def test_run_announces_paper_mode(paper_yaml, signals_csv, root):

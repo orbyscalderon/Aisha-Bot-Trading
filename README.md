@@ -5,10 +5,15 @@ Bot de copy-trading multimercado.
 Copia las compras de traders que sigues, con límites de riesgo estrictos, y te deja
 **probar la estrategia sobre datos pasados antes de arriesgar nada**.
 
-> **ADVERTENCIA: el modo real NO existe todavía.**
-> Este bot no envía órdenes reales a ningún exchange. Solo hace backtest y ejecución
-> **simulada** (paper). Con `mode: live`, `run` se niega a arrancar y termina con error:
-> la ejecución real es una fase posterior del desarrollo (el "plan 3" del plan de trabajo interno), que se construye a propósito después de probar bien el resto. No hay ninguna forma de que este código mueva dinero.
+> **ADVERTENCIA: este bot YA PUEDE mover dinero real.**
+> Por defecto no lo hace: con `mode: paper` todo es simulado, y con `mode: live` opera
+> contra el **testnet** del exchange, que usa dinero de mentira. Para gastar dinero de
+> verdad hacen falta **dos actos deliberados e independientes**: escribir `testnet: false`
+> en el YAML (que se versiona, así que queda en el historial) y pasar `--dinero-real` al
+> arrancar. Con uno solo, el bot se niega y no ejecuta nada.
+>
+> La ejecución real en **Solana** sigue sin existir: `--solana-wallet` solo sirve para leer
+> señales, que luego se operan en el CEX.
 
 ## Qué hace y qué no hace
 
@@ -30,10 +35,15 @@ Hace:
   infraestructura.
 - **Se maneja por Telegram**: `/estado`, `/posiciones`, `/pausa`, `/stop`, en español o en
   inglés. Con una clave de Claude entiende además frases libres.
-- **Arranca solo con el equipo** (`scripts/instalar-servicio.ps1`, Windows).
+- **Opera de verdad en un CEX** (`mode: live`): manda órdenes a mercado vía ccxt, contra
+  el testnet de Binance por defecto. Traduce los fallos del exchange con cuidado para no
+  reintentar nunca una orden que pudo ejecutarse.
+- **Arranca solo**: en la nube con Docker (`Dockerfile`), o en Windows con
+  `scripts/instalar-servicio.ps1`.
 
 No hace:
-- Ejecución real (plan 3). Ni conecta claves de trading ni envía órdenes.
+- Ejecución real en Solana. Las wallets se leen, pero los swaps no se replican on-chain:
+  los tokens que operan no cotizan en un CEX, así que copiar allí no es posible.
 - Garantizar nada: un backtest rentable no predice resultados futuros.
 - Decirte a quién copiar. La criba **descarta** con seguridad; que una wallet la pase solo
   significa que merece un backtest, no que ganes dinero copiándola.
@@ -226,6 +236,49 @@ traders si solo miras las pocas operaciones que se les entienden.
 excelente con posiciones de seis meses es inútil con un time-stop de 72 h) y lo contesta el
 backtest.
 
+## Operar de verdad en un exchange (modo live)
+
+Con `mode: live` el bot manda **órdenes a mercado reales** por la API del exchange (ccxt).
+Por defecto van al **testnet**, donde el dinero es de mentira pero todo lo demás es real.
+
+```bash
+# 1. Claves de testnet: https://testnet.binance.vision -> Generate HMAC-SHA-256 Key
+#    Permisos: TRADE y USER_DATA. En Binance de verdad, la retirada DESACTIVADA.
+#    Van al .env como EXCHANGE_API_KEY y EXCHANGE_API_SECRET.
+
+# 2. Arrancar contra el testnet
+python -m cli run --config config/testnet.yaml --signals senales.csv
+```
+
+El bot dice al arrancar contra qué está operando, siempre y sin rodeos:
+
+```
+mode: live | arrancando EN VIVO contra testnet de binance (config a1b2c3d4e5f6)
+```
+
+### Para gastar dinero real hacen falta dos llaves
+
+Y son **independientes a propósito**:
+
+1. `testnet: false` en el YAML, que se versiona y queda en el historial de git.
+2. `--dinero-real` al arrancar.
+
+Con una sola, el bot se niega y no ejecuta nada. Un fichero de configuración copiado de
+otro sitio no basta para empezar a gastar, y una bandera tecleada por costumbre tampoco.
+
+### Qué pasa cuando el exchange falla
+
+Es lo que más cuidado lleva, porque equivocarse aquí manda la misma compra dos veces:
+
+- **El exchange contesta que no** (saldo insuficiente, orden inválida, par inexistente):
+  la orden no entró. Se marca fallida y la señal se puede reintentar.
+- **La petición falla sin respuesta** (timeout, red caída, límite de tasa): *no se sabe*
+  si entró. La orden queda en estado incierto, **bloquea el reintento** y avisa como
+  crítico para reconciliarla a mano.
+
+Por eso no se reintenta ningún envío, ni siquiera un límite de tasa: el primer intento
+pudo llegar. Perder una oportunidad es barato; comprar dos veces, no.
+
 ## Arranque automático (Windows)
 
 ```powershell
@@ -239,6 +292,36 @@ virtual, la configuración y la clave de Helius, y se niega si el YAML dice `mod
 
 Parada de emergencia: crea un fichero vacío llamado `STOP` en la carpeta del bot, o mándale
 `/stop` por Telegram. Desinstalar: `scripts\desinstalar-servicio.ps1`.
+
+## Desplegar en la nube (Docker)
+
+El bot debe vivir en un servidor encendido, no en tu PC: apagarlo deja de vigilar las
+posiciones abiertas y un stop-loss no salta solo.
+
+```bash
+git clone <repo> && cd <repo>
+cp config/.env.example .env     # y rellénalo EN EL SERVIDOR
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+Levanta dos contenedores: el **bot** y el **barrido** de wallets de Solana cada 4 horas,
+que es de solo lectura y no gasta peticiones de Helius.
+
+Tres cosas que no se pueden hacer mal:
+
+- **El volumen `aisha-datos` es obligatorio.** Ahí viven la base de datos (posiciones,
+  fills, auditoría) y el fichero `STOP`. Sin él, cada despliegue arranca con las
+  posiciones abiertas perdidas, y lo hace **en silencio**.
+- **Nunca un proveedor que duerma el proceso por inactividad.** El bot revisa las salidas
+  cada 60 s; dormido no revisa nada y la posición sigue cayendo. Eso descarta los planes
+  gratuitos que hibernan. Un VPS normal (unos 5 €/mes) vale de sobra.
+- **Los secretos van como variables de entorno del servidor**, nunca dentro de la imagen.
+  El `.dockerignore` excluye el `.env` del build, y el bot da prioridad al entorno real
+  sobre el fichero, que es justo lo que la nube necesita.
+
+Para pararlo: `docker compose down` (los datos sobreviven), o `/stop` por Telegram, o un
+fichero `STOP` en el volumen.
 
 ## Probar un backtest rápido
 

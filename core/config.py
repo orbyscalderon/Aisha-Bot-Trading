@@ -106,6 +106,12 @@ class CexConfig(_Strict):
     # Activos que get_balance ignora al sumar el capital (residuos ajenos al bot,
     # p. ej. tokens de Earn). Ojo: listar una stablecoin quita ese efectivo del capital.
     ignore_assets: list[str] = Field(default_factory=list)
+    # Red del exchange en modo live. POR DEFECTO TESTNET, y es deliberado: quien
+    # olvide poner esto opera con dinero de mentira, no con el suyo. El error por
+    # descuido cuesta entonces una oportunidad, no una cuenta. Pasar a real exige
+    # escribir `testnet: false` a mano, que es justo la clase de decisión que no
+    # debe poder tomarse sin darse cuenta. En simulado no se usa.
+    testnet: bool = True
 
 
 class ExecutionConfig(_Strict):

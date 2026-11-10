@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "copy-trading-bot"
 version = "0.1.0"
-description = "Bot de copy-trading: backtest y ejecución simulada (la ejecución real no existe todavía)."
+description = "Bot de copy-trading: backtest, ejecución simulada y ejecución real contra un CEX."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

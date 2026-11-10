@@ -30,6 +30,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import ccxt
 import typer
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -45,7 +46,8 @@ from adapters.cex.history import (
     validate_timeframe,
     write_quotes_csv,
 )
-from adapters.cex.source import CexCsvSignalSource, CexDataSource
+from adapters.cex.executor import CexExecutor
+from adapters.cex.source import CexCsvSignalSource, CexDataSource, make_exchange_client
 from adapters.env import load_dotenv
 from adapters.solana.prices import (
     JupiterPriceSource,
@@ -92,7 +94,7 @@ from core.engine import Engine
 from core.models import Market, Mode, Quote
 from core.portfolio import Portfolio
 from core.safety import KILL_SWITCH_FILENAME, CircuitBreaker, is_kill_switch_active, mode_prefix
-from ports.market import MarketDataSource
+from ports.market import MarketDataSource, OrderExecutor
 from ports.notifier import Level, Notifier
 from storage.audit import AuditLog
 from storage.db import init_db
@@ -108,7 +110,7 @@ FETCH_MAX_REQUESTS = DEFAULT_MAX_REQUESTS
 _PROTECTION_FIELDS = ("cooldown_minutes", "stop_loss_streak", "max_drawdown_pct", "max_usd_per_group")
 
 app = typer.Typer(
-    help="Bot de copy-trading: backtest y ejecución simulada. La ejecución real no existe todavía.",
+    help="Bot de copy-trading: backtest, simulado (paper) y real contra un CEX (live, testnet por defecto).",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -119,7 +121,32 @@ class InvalidExchange(Exception):
 
 
 class LiveModeNotImplemented(RuntimeError):
-    """La ejecución real llega en el plan 3."""
+    """Queda para los mercados cuya ejecución real aún no existe (Solana, acciones)."""
+
+
+class MissingExchangeCredentials(Exception):
+    """Modo live sin claves del exchange: no hay con qué operar."""
+
+
+EXCHANGE_KEY_VAR = "EXCHANGE_API_KEY"
+EXCHANGE_SECRET_VAR = "EXCHANGE_API_SECRET"
+
+
+def _exchange_credentials() -> tuple[str, str]:
+    """Claves del exchange desde el entorno. Nunca del YAML: ese fichero se versiona.
+
+    Devuelve las dos o falla; con media clave no se opera. El mensaje dice qué falta
+    sin decir qué hay: un error que imprimiera la clave la dejaría en los logs.
+    """
+    clave = (os.environ.get(EXCHANGE_KEY_VAR) or "").strip()
+    secreto = (os.environ.get(EXCHANGE_SECRET_VAR) or "").strip()
+    faltan = [n for n, v in ((EXCHANGE_KEY_VAR, clave), (EXCHANGE_SECRET_VAR, secreto)) if not v]
+    if faltan:
+        raise MissingExchangeCredentials(
+            f"modo live sin {' ni '.join(faltan)}: ponlos en el .env "
+            "(o como variables de entorno en la nube) y vuelve a arrancar"
+        )
+    return clave, secreto
 
 
 @dataclass
@@ -128,6 +155,7 @@ class CliDeps:
 
     scheduler: Any = None
     data_source: MarketDataSource | None = None
+    executor: OrderExecutor | None = None  # el real lo elige el modo (paper o live)
     notifier: Notifier | None = None
     history_client: Any = None  # cliente ccxt de fetch-quotes
     sleep: Callable[[float], None] | None = None  # temporizador de fetch-quotes
@@ -233,17 +261,29 @@ def _build(
     *,
     exchange_id: str = DEFAULT_EXCHANGE,
     data_source: MarketDataSource | None = None,
+    executor: OrderExecutor | None = None,
     notifier: Notifier | None = None,
     paper_capital: Decimal = DEFAULT_CAPITAL,
 ) -> tuple[Engine, Notifier, AuditLog]:
-    if config.mode is Mode.LIVE:
-        raise LiveModeNotImplemented(
-            "modo live no implementado: la ejecución real llega en el plan 3"
-        )
+    en_vivo = config.mode is Mode.LIVE
+    cliente: Any = None
     # La fuente de datos va ANTES de tocar el disco: un exchange inválido no deja una base
     # de datos creada ni una conexión colgando. Solo se captura el error esperado.
     if data_source is not None:
         raw_data = data_source
+    elif en_vivo:
+        clave, secreto = _exchange_credentials()
+        try:
+            cliente = make_exchange_client(
+                exchange_id, clave, secreto, testnet=config.cex.testnet
+            )
+        except ValueError as exc:
+            raise InvalidExchange(f"exchange no válido {exchange_id!r}: {exc}") from exc
+        # Cargar los mercados al arrancar, no al primer ciclo: de aquí sale la precisión
+        # de cantidad que usa el ejecutor para redondear las ventas. Sin ella redondearía
+        # con el valor de respaldo y el exchange podría tumbar un stop-loss por lote.
+        cliente.load_markets()
+        raw_data = CexDataSource.from_client(cliente, ignore_assets=config.cex.ignore_assets)
     else:
         try:
             raw_data = CexDataSource(exchange_id, ignore_assets=config.cex.ignore_assets)
@@ -257,11 +297,27 @@ def _build(
     db_path = root / f"{config.mode.value}.db"
     conn = init_db(db_path, check_same_thread=False)
     repo = Repository(conn)
-    data = PaperCapitalSource(raw_data, repo, paper_capital)
     exec_cfg = config.execution[Market.CEX]
-    executor = PaperExecutor(
-        data, exec_cfg.slippage_bps, exec_cfg.fee_bps, exec_cfg.quantity_precision
-    )
+    if en_vivo:
+        # Capital REAL de la cuenta, sin envolver: en vivo el dinero es el que hay,
+        # no el que dice un número de configuración.
+        data = raw_data
+        if executor is None:
+            if cliente is None:
+                # Pasa si alguien inyecta una fuente de datos en modo live sin inyectar
+                # ejecutor. Sin cliente no hay con qué operar, y un CexExecutor envolviendo
+                # None construiría sin quejarse y fallaría en la primera orden de verdad.
+                raise LiveModeNotImplemented(
+                    "modo live con una fuente de datos inyectada necesita también un "
+                    "ejecutor: sin cliente del exchange no hay forma de mandar órdenes"
+                )
+            executor = CexExecutor(cliente, quantity_precision=exec_cfg.quantity_precision)
+    else:
+        data = PaperCapitalSource(raw_data, repo, paper_capital)
+        if executor is None:
+            executor = PaperExecutor(
+                data, exec_cfg.slippage_bps, exec_cfg.fee_bps, exec_cfg.quantity_precision
+            )
     notifier = notifier if notifier is not None else _make_notifier(config.mode)
     engine = Engine(
         config=config, repo=repo, audit=AuditLog(conn), portfolio=Portfolio(repo),
@@ -524,18 +580,25 @@ def run(
     root: Path = RootOpt,
     once: bool = typer.Option(False, "--once", help="Un ciclo de entrada y uno de salida, y termina."),
     exchange: str = typer.Option(DEFAULT_EXCHANGE, "--exchange", help="Exchange (ccxt) de las cotizaciones."),
-    capital: str = typer.Option(str(DEFAULT_CAPITAL), "--capital", help="Capital simulado en USD."),
+    capital: str = typer.Option(str(DEFAULT_CAPITAL), "--capital", help="Capital simulado en USD (ignorado en live: ahí manda el saldo real)."),
+    dinero_real: bool = typer.Option(
+        False, "--dinero-real",
+        help="Confirma operar con DINERO REAL. Solo tiene efecto con mode: live y testnet: false.",
+    ),
 ) -> None:
-    """Ejecuta el bot en modo simulado (paper)."""
+    """Ejecuta el bot: simulado (paper) o real (live) contra el exchange."""
     deps = _deps(ctx)
     _load_env(root)
     cfg = _load(config)
-    if cfg.mode is Mode.LIVE:
-        # Negarse: ejecutar en simulado creyendo que es real sería la peor confusión posible.
+    if cfg.mode is Mode.LIVE and not cfg.cex.testnet and not dinero_real:
+        # Operar con dinero de verdad exige DOS actos deliberados e independientes:
+        # escribir `testnet: false` en el YAML (que se versiona, así que queda en el
+        # historial) y pasar esta bandera al arrancar. Con un solo interruptor, un
+        # fichero copiado de otro sitio bastaría para empezar a gastar sin querer.
         raise _fail(
-            f"{mode_prefix(cfg.mode)} | modo live no implementado: la ejecución real llega en el "
-            "plan 3. No se ha ejecutado nada (ni siquiera en simulado). "
-            "Usa mode: paper para operar en simulado.",
+            f"{mode_prefix(cfg.mode)} | la configuración dice testnet: false, es decir DINERO "
+            "REAL en el exchange. No se ha ejecutado nada. Si es lo que quieres, añade "
+            "--dinero-real; si no, pon testnet: true.",
             3,
         )
     if signals is None and not solana_wallet:
@@ -581,15 +644,28 @@ def run(
             sleep=deps.sleep if deps.sleep is not None else time.sleep,
         )
 
-    _say(cfg, f"arrancando en simulado (config {cfg.fingerprint()[:12]})")
+    # Decirlo SIEMPRE y sin ambigüedad. Confundir testnet con dinero real en cualquiera
+    # de los dos sentidos es la peor equivocación posible con este programa.
+    if cfg.mode is Mode.LIVE:
+        donde = f"testnet de {exchange}" if cfg.cex.testnet else f"DINERO REAL en {exchange}"
+        _say(cfg, f"arrancando EN VIVO contra {donde} (config {cfg.fingerprint()[:12]})")
+    else:
+        _say(cfg, f"arrancando en simulado (config {cfg.fingerprint()[:12]})")
     try:
         engine, notifier, audit = _build(
             cfg, root, exchange_id=exchange,
             data_source=deps.data_source if deps.data_source is not None else live_data,
-            notifier=deps.notifier, paper_capital=_parse_capital(capital),
+            executor=deps.executor, notifier=deps.notifier,
+            paper_capital=_parse_capital(capital),
         )
     except InvalidExchange as exc:
         raise _fail(str(exc), 2) from None
+    except MissingExchangeCredentials as exc:
+        raise _fail(str(exc), 2) from None
+    except ccxt.BaseError as exc:
+        # Claves inválidas, exchange caído o sin red al cargar los mercados. Parar aquí
+        # con un mensaje: un bot que arranca sin poder operar es peor que uno que no arranca.
+        raise _fail(f"no se pudo conectar con {exchange}: {exc}", 2) from None
     warn_if_no_protections(cfg, notifier)
     warn_if_copy_sell_primary(cfg, notifier)
     source = live_source if live_source is not None else CexCsvSignalSource(signals)
