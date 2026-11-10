@@ -209,6 +209,22 @@ class CexExecutor(OrderExecutor):
             )
 
         price = self._executed_price(raw, order)
+        # Lo que se RECIBE, no lo que se ejecuta. Binance cobra la comisión de una compra
+        # en el activo comprado, así que de 0,00033 BTC ejecutados entran 0,00032967. El
+        # motor guarda esta cantidad en la posición y luego intenta venderla entera: con
+        # la cifra bruta, el exchange contesta "saldo insuficiente", eso es un rechazo
+        # definitivo, se reintenta y vuelve a fallar. La posición no se podría cerrar
+        # NUNCA y el stop-loss no saltaría. Verificado contra el testnet de Binance.
+        # Solo en la COMPRA: ahí `filled` es lo que entra y la comisión lo recorta. En una
+        # venta `filled` es lo que salió de la cuenta, y restarle algo mentiría sobre la
+        # operación; además Binance cobra la venta en la moneda de cotización, no en BTC.
+        if side is Side.BUY:
+            filled -= self._base_fee(raw, order)
+            if filled <= 0:
+                raise AmbiguousOrder(
+                    f"{order.client_order_id}: la comisión se come la cantidad entera "
+                    f"({raw.get('filled')} ejecutado)"
+                )
         status = raw.get("status")
         if status != "closed":
             # Llenado PARCIAL: se registra lo ejecutado, que es real, y se avisa.
@@ -262,17 +278,9 @@ class CexExecutor(OrderExecutor):
         ese último caso se cuenta 0 y se AVISA: inventar un cambio metería un
         número falso en la contabilidad, y un cero avisado es auditable.
         """
-        comisiones = raw.get("fees")
-        if not comisiones:
-            una = raw.get("fee")
-            comisiones = [una] if una else []
+        base, _, cotizacion = order.symbol.partition("/")
         total = Decimal(0)
-        for comision in comisiones:
-            if not isinstance(comision, dict) or comision.get("cost") is None:
-                continue
-            coste = _to_decimal(comision["cost"], f"{order.client_order_id}: comisión")
-            moneda = (comision.get("currency") or "").upper()
-            base, _, cotizacion = order.symbol.partition("/")
+        for coste, moneda in self._fees(raw, order):
             if moneda in _STABLES or moneda == cotizacion.upper():
                 total += coste
             elif moneda == base.upper():
@@ -284,6 +292,30 @@ class CexExecutor(OrderExecutor):
                     order.client_order_id, coste, moneda,
                 )
         return total
+
+    def _base_fee(self, raw: dict, order: Order) -> Decimal:
+        """Comisión cobrada en el ACTIVO negociado, que reduce lo que se recibe."""
+        base = order.symbol.partition("/")[0].upper()
+        return sum(
+            (coste for coste, moneda in self._fees(raw, order) if moneda == base),
+            Decimal(0),
+        )
+
+    def _fees(self, raw: dict, order: Order) -> list[tuple[Decimal, str]]:
+        """Comisiones reportadas, como (coste, moneda). ccxt usa 'fees' o 'fee'."""
+        comisiones = raw.get("fees")
+        if not comisiones:
+            una = raw.get("fee")
+            comisiones = [una] if una else []
+        salida: list[tuple[Decimal, str]] = []
+        for comision in comisiones:
+            if not isinstance(comision, dict) or comision.get("cost") is None:
+                continue
+            salida.append((
+                _to_decimal(comision["cost"], f"{order.client_order_id}: comisión"),
+                (comision.get("currency") or "").upper(),
+            ))
+        return salida
 
     def _timestamp(self, raw: dict) -> datetime:
         """Hora del exchange si la da; si no, la nuestra.

@@ -310,6 +310,43 @@ def test_un_llenado_PARCIAL_registra_lo_ejecutado(caplog):
     assert "open" in caplog.text
 
 
+# --- lo que se recibe no es lo que se ejecuta ----------------------------------
+
+
+def test_la_compra_descuenta_la_comision_cobrada_en_el_activo_comprado():
+    """El tercer fallo del mismo tipo encontrado hoy, y el único que el testnet tapó.
+
+    Binance cobra la comisión de una compra EN BTC: de 0,00033 ejecutados entran
+    0,00032967. El motor guarda esa cantidad en la posición y luego la vende entera.
+    Con la cifra bruta el exchange contesta "saldo insuficiente", que es un rechazo
+    definitivo, el motor reintenta y vuelve a fallar: la posición no se cierra nunca
+    y el stop-loss no salta. Los números son los de una operación real en testnet.
+    """
+    c = FakeClient({**RESPUESTA, "filled": "0.00033", "average": "75192.01",
+                    "fee": {"cost": "0.00000033", "currency": "BTC"}})
+    assert ejecutor(c).submit_buy(compra()).quantity == Decimal("0.00032967")
+
+
+def test_una_comision_en_la_moneda_de_cotizacion_no_toca_la_cantidad():
+    """Si se cobra en USDT, lo recibido en BTC es lo ejecutado."""
+    c = FakeClient({**RESPUESTA, "filled": "0.002", "fee": {"cost": "0.1", "currency": "USDT"}})
+    assert ejecutor(c).submit_buy(compra()).quantity == Decimal("0.002")
+
+
+def test_la_VENTA_no_descuenta_nada_de_la_cantidad():
+    """En una venta `filled` es lo que salió de la cuenta. Restarle algo mentiría."""
+    c = FakeClient({**RESPUESTA, "filled": "0.002", "fee": {"cost": "0.000002", "currency": "BTC"}})
+    assert ejecutor(c).submit_sell(venta()).quantity == Decimal("0.002")
+
+
+def test_si_la_comision_se_come_la_compra_entera_es_ambiguo_no_un_rechazo():
+    """Se ejecutó algo: decir 'rechazada' haría que se comprara otra vez."""
+    c = FakeClient({**RESPUESTA, "filled": "0.001", "fee": {"cost": "0.001", "currency": "BTC"}})
+    with pytest.raises(Exception) as excinfo:
+        ejecutor(c).submit_buy(compra())
+    assert not isinstance(excinfo.value, OrderRejected)
+
+
 # --- comisiones ----------------------------------------------------------------
 
 
