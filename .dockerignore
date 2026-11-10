@@ -1,0 +1,29 @@
+# Lo PRIMERO y lo que mas importa: los secretos no entran en la imagen.
+# Una imagen con el .env dentro filtra las claves a cualquiera que haga `docker save`,
+# la suba a un registro o la reciba. El bot lee los secretos del ENTORNO en la nube, y
+# `adapters/env.py` ya da prioridad al entorno real sobre el fichero: no hace falta el .env.
+.env
+.env.*
+!config/.env.example
+
+# Estado. Va en un volumen montado, nunca horneado en la imagen: una base de datos dentro
+# de la imagen reaparece en cada despliegue con las posiciones de cuando se construyo.
+*.db
+*.db-journal
+*.db-wal
+datos/
+logs/
+
+# Entorno local: es de Windows y pesa cientos de megas. La imagen instala el suyo.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Especificos de tu PC: no sirven en Linux.
+scripts/*.ps1
+scripts/*.cmd
+
+.git/
+.gitignore

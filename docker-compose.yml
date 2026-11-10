@@ -1,0 +1,72 @@
+# Despliegue del bot en un servidor. Sustituye a las tareas programadas de Windows
+# (scripts/instalar-servicio.ps1 y scripts/instalar-barrido.ps1), que solo valen en tu PC.
+#
+# Arrancar:   docker compose up -d --build
+# Ver logs:   docker compose logs -f bot
+# Parar:      docker compose down          (los datos sobreviven: están en un volumen)
+#
+# Los secretos salen del fichero .env del SERVIDOR, que compose lee al arrancar y pasa
+# como variables de entorno. No entran en la imagen: el .dockerignore los excluye del
+# build, y adapters/env.py da prioridad al entorno real sobre el fichero.
+
+services:
+  bot:
+    build: .
+    image: aisha-bot
+    # unless-stopped y no "always": si lo paras a mano, se queda parado aunque se
+    # reinicie el servidor. Un bot que resucita solo tras pararlo a propósito es
+    # exactamente lo que no quieres el día que lo paras por una razón.
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # El estado del bot: base de datos (posiciones, fills, auditoría) y el fichero
+      # STOP del kill switch. SIN ESTE VOLUMEN, cada despliegue arranca con las
+      # posiciones abiertas perdidas y sin forma de reconciliarlas.
+      - aisha-datos:/datos
+    # ELIGE UNA FUENTE DE SEÑALES: el bot se niega a arrancar sin exactamente una.
+    #   --signals /datos/senales.csv        -> CSV, que debe existir YA en el volumen
+    #   --solana-wallet <direccion>         -> copia esa wallet en vivo (repetible)
+    # Y elige el modo cambiando el YAML:
+    #   config/paper.yaml    -> simulado, no toca el exchange
+    #   config/testnet.yaml  -> órdenes REALES contra el testnet, dinero de mentira
+    command: >
+      run --config config/paper.yaml --root /datos
+      --signals /datos/senales.csv
+    # Los logs no deben llenar el disco del servidor y tirar el bot por falta de espacio.
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  # Barrido de wallets de Solana: SOLO LECTURA. No opera, no toca la base del bot y no
+  # gasta peticiones de Helius (GeckoTerminal es gratis). Es independiente del bot, que
+  # es justo lo que hace falta mientras aún no hay a quién copiar.
+  barrido:
+    build: .
+    image: aisha-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - aisha-datos:/datos
+    # Bucle propio en vez de cron: un contenedor con cron dentro necesita un gestor de
+    # procesos y manda la salida a un fichero que nadie mira. Así los fallos salen por
+    # `docker compose logs`, donde ya se mira todo lo demás.
+    #
+    # El `|| true` es deliberado: un barrido que falla (GeckoTerminal caída, un 429) no
+    # debe tumbar el bucle. El historial se acumula durante días y perder una pasada no
+    # es grave; perder el bucle entero sí, porque el sesgo que esto corrige solo se
+    # corrige repitiendo. El fallo queda en los logs y se reintenta a las 4 horas.
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      'while true; do
+         python -m cli discover-solana-wallets
+           --config config/paper.yaml
+           --historial /datos/barridos.csv
+           --max-pools 12 --min-operacion 300 || true;
+         sleep 14400;
+       done'
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  aisha-datos:
